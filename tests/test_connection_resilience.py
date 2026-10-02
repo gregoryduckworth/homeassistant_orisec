@@ -392,5 +392,65 @@ class TestUpdateDataDisconnected(unittest.TestCase):
         run_async(_test())
 
 
+class TestSocketReuse(unittest.TestCase):
+
+    def test_connect_is_noop_when_socket_open(self):
+        async def _test():
+            conn = OrisecConnection("127.0.0.1", 44444)
+            await conn.connect()
+            first = conn._transport
+            try:
+                await conn.connect()
+                self.assertIs(conn._transport, first)
+            finally:
+                await conn.disconnect()
+
+        run_async(_test())
+
+    def test_connect_recreates_closed_socket(self):
+        async def _test():
+            conn = OrisecConnection("127.0.0.1", 44444)
+            await conn.connect()
+            first = conn._transport
+            first.close()
+            try:
+                await conn.connect()
+                self.assertIsNot(conn._transport, first)
+                self.assertTrue(conn.connected)
+            finally:
+                await conn.disconnect()
+
+        run_async(_test())
+
+    def test_reconnect_and_poll_failure_keep_socket(self):
+        async def _test():
+            hass = MagicMock()
+            hass.async_create_task = lambda coro, name=None: asyncio.ensure_future(coro)
+            coord = OrisecCoordinator(hass, "127.0.0.1", 44444, "1234")
+            coord.max_zones = 10
+            coord.max_areas = 2
+            coord._stage = 3
+
+            disconnect = AsyncMock()
+            coord._conn.disconnect = disconnect
+            coord._conn._transport = MagicMock()
+            coord._conn._transport.is_closing.return_value = False
+            coord._conn.multi_query = AsyncMock(side_effect=ConnectionError("boom"))
+            coord._conn.connect = AsyncMock()
+            coord._do_login = AsyncMock()
+            coord._do_config = AsyncMock()
+            coord._do_initial_data = AsyncMock()
+
+            with patch("custom_components.orisec.coordinator.asyncio.sleep", new_callable=AsyncMock):
+                with self.assertRaises(_UpdateFailed):
+                    await coord._async_update_data()
+                await coord._reconnect_task
+
+            disconnect.assert_not_called()
+            self.assertEqual(coord._stage, 3)
+
+        run_async(_test())
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -158,8 +158,8 @@ class OrisecCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     "Setup attempt %d/%d for %s:%s",
                     attempt, SETUP_MAX_RETRIES, self._host, self._port,
                 )
-                await self._conn.disconnect()
-                await asyncio.sleep(CONFIG_FLOW_GRACE_PERIOD)
+                if attempt == 1:
+                    await asyncio.sleep(CONFIG_FLOW_GRACE_PERIOD)
                 await self._conn.connect()
                 await self._do_login()
                 await self._do_config()
@@ -172,10 +172,6 @@ class OrisecCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 _LOGGER.debug(
                     "Setup attempt %d failed: %s", attempt, err,
                 )
-                try:
-                    await self._conn.disconnect()
-                except Exception:
-                    pass
                 if attempt < SETUP_MAX_RETRIES:
                     delay = min(
                         SETUP_BACKOFF_BASE ** attempt + random.uniform(0, 1),
@@ -298,8 +294,6 @@ class OrisecCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             )
             await asyncio.sleep(delay)
             try:
-                await self._conn.disconnect()
-                await asyncio.sleep(CONFIG_FLOW_GRACE_PERIOD)
                 await self._conn.connect()
                 await self._do_login()
                 await self._do_config()
@@ -314,10 +308,6 @@ class OrisecCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 return
             except (ConnectionError, OSError, asyncio.TimeoutError, UpdateFailed) as err:
                 _LOGGER.debug("Reconnect attempt %d failed: %s", self._reconnect_attempts, err)
-                try:
-                    await self._conn.disconnect()
-                except Exception:
-                    pass
 
     def _start_reconnect(self) -> None:
         if self._reconnect_task is not None and not self._reconnect_task.done():
@@ -402,10 +392,6 @@ class OrisecCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         except Exception as err:
             self._stage = 0
-            try:
-                await self._conn.disconnect()
-            except Exception:
-                pass
             self._start_reconnect()
             if isinstance(err, UpdateFailed):
                 raise

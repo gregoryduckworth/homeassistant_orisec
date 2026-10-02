@@ -434,7 +434,7 @@ class OrisecConnection:
         self._protocol: OrisecUDPProtocol | None = None
 
     async def connect(self) -> None:
-        if self._transport is not None:
+        if self.connected:
             return
         loop = asyncio.get_running_loop()
         self._transport, self._protocol = await loop.create_datagram_endpoint(
