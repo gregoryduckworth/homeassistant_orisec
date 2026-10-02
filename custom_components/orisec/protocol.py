@@ -400,6 +400,10 @@ def parse_responses(
     return result
 
 
+class PanelRefusedError(ConnectionError):
+    """The panel answered with ICMP port-unreachable; retrying quickly won't help."""
+
+
 class OrisecUDPProtocol(asyncio.DatagramProtocol):
 
     def __init__(self) -> None:
@@ -479,6 +483,12 @@ class OrisecConnection:
                 if attempt < SEND_RETRIES:
                     await asyncio.sleep(0.3 * attempt)
                 continue
+
+            if isinstance(self._protocol.error, ConnectionRefusedError):
+                raise PanelRefusedError(
+                    f"Panel at {self.host}:{self.port} refused the connection "
+                    "(nothing listening on that port)"
+                )
 
             if self._protocol.error:
                 last_error = ConnectionError(f"UDP error: {self._protocol.error}")

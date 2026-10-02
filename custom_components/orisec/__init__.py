@@ -69,12 +69,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         await coordinator.async_setup()
     except (ConnectionError, OSError, asyncio.TimeoutError, UpdateFailed) as err:
         _LOGGER.warning(
-            "Failed to connect to Orisec panel at %s:%s after retries: %s",
-            host, port, err,
+            "Failed to connect to Orisec panel at %s:%s: %s", host, port, err,
         )
         raise ConfigEntryNotReady(
-            f"Cannot connect to Orisec panel at {host}:{port} "
-            f"after retries: {err}"
+            f"Cannot connect to Orisec panel at {host}:{port}: {err}"
         ) from err
 
     hass.data.setdefault(DOMAIN, {})

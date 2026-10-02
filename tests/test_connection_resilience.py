@@ -96,7 +96,11 @@ for mod_name, mod in [
 ]:
     sys.modules[mod_name] = mod
 
-from custom_components.orisec.protocol import OrisecConnection, OrisecUDPProtocol
+from custom_components.orisec.protocol import (
+    OrisecConnection,
+    OrisecUDPProtocol,
+    PanelRefusedError,
+)
 from custom_components.orisec.coordinator import OrisecCoordinator
 from custom_components.orisec.const import SEND_RETRIES
 
@@ -448,6 +452,75 @@ class TestSocketReuse(unittest.TestCase):
 
             disconnect.assert_not_called()
             self.assertEqual(coord._stage, 3)
+
+        run_async(_test())
+
+
+class TestRefusedBackoff(unittest.TestCase):
+
+    def test_send_receive_raises_refused_without_retrying(self):
+        async def _test():
+            conn = OrisecConnection("127.0.0.1", 44444, timeout=1.0)
+            proto = OrisecUDPProtocol()
+            transport = MagicMock()
+            conn._transport = transport
+            conn._protocol = proto
+
+            def fake_sendto(data):
+                proto.error_received(ConnectionRefusedError(111, "Connection refused"))
+
+            transport.sendto = MagicMock(side_effect=fake_sendto)
+
+            from custom_components.orisec.protocol import load_udl_pkt
+            with self.assertRaises(PanelRefusedError):
+                await conn.send_receive(load_udl_pkt(1, 1, 1), settle_time=0.01)
+            self.assertEqual(transport.sendto.call_count, 1)
+
+        run_async(_test())
+
+    def test_setup_gives_up_immediately_when_refused(self):
+        async def _test():
+            coord = OrisecCoordinator(MagicMock(), "127.0.0.1", 44444, "1234")
+            coord._conn.connect = AsyncMock()
+            coord._do_login = AsyncMock(side_effect=PanelRefusedError("refused"))
+
+            with patch("custom_components.orisec.coordinator.asyncio.sleep", new_callable=AsyncMock):
+                with self.assertRaises(PanelRefusedError):
+                    await coord.async_setup()
+            self.assertEqual(coord._do_login.call_count, 1)
+
+        run_async(_test())
+
+    def test_backoff_is_long_after_refusal_and_capped(self):
+        coord = OrisecCoordinator(MagicMock(), "127.0.0.1", 44444, "1234")
+
+        coord._last_error_refused = True
+        self.assertTrue(30 <= coord._backoff_delay(1) < 31)
+        self.assertTrue(60 <= coord._backoff_delay(2) < 61)
+        self.assertTrue(600 <= coord._backoff_delay(10) < 601)
+
+        coord._last_error_refused = False
+        self.assertTrue(2 <= coord._backoff_delay(1) < 3)
+        self.assertTrue(60 <= coord._backoff_delay(10) < 61)
+
+    def test_reconnect_switches_to_long_backoff_after_refusal(self):
+        async def _test():
+            hass = MagicMock()
+            coord = OrisecCoordinator(hass, "127.0.0.1", 44444, "1234")
+            coord._conn.connect = AsyncMock()
+            coord._do_login = AsyncMock(side_effect=[PanelRefusedError("refused"), None])
+            coord._do_config = AsyncMock()
+            coord._do_initial_data = AsyncMock()
+
+            sleep = AsyncMock()
+            with patch("custom_components.orisec.coordinator.asyncio.sleep", sleep):
+                await coord._reconnect()
+
+            delays = [c.args[0] for c in sleep.call_args_list]
+            self.assertLess(delays[0], 4)
+            self.assertGreaterEqual(delays[1], 60)
+            self.assertEqual(coord._stage, 3)
+            self.assertFalse(coord._last_error_refused)
 
         run_async(_test())
 

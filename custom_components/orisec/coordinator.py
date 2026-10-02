@@ -18,6 +18,8 @@ from .const import (
     POLL_INTERVAL,
     RECONNECT_BACKOFF_BASE,
     RECONNECT_BACKOFF_MAX,
+    REFUSED_BACKOFF_BASE,
+    REFUSED_BACKOFF_MAX,
     SETUP_BACKOFF_BASE,
     SETUP_BACKOFF_MAX,
     SETUP_MAX_RETRIES,
@@ -71,6 +73,7 @@ from .const import (
 )
 from .protocol import (
     OrisecConnection,
+    PanelRefusedError,
     ParsedResponse,
     add_udl_pkt,
     load_udl_pkt,
@@ -141,6 +144,7 @@ class OrisecCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         self._reconnect_task: asyncio.Task | None = None
         self._reconnect_attempts: int = 0
+        self._last_error_refused: bool = False
 
     @property
     def host(self) -> str:
@@ -167,6 +171,8 @@ class OrisecCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 self._stage = 3
                 _LOGGER.debug("Setup succeeded on attempt %d", attempt)
                 return
+            except PanelRefusedError:
+                raise
             except (ConnectionError, OSError, asyncio.TimeoutError, UpdateFailed) as err:
                 last_err = err
                 _LOGGER.debug(
@@ -280,14 +286,17 @@ class OrisecCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.sys_output_state = r.sys_output_state
         self.zone_status = r.zone_status
 
+    def _backoff_delay(self, attempt: int) -> float:
+        if self._last_error_refused:
+            delay = min(REFUSED_BACKOFF_BASE * 2 ** (attempt - 1), REFUSED_BACKOFF_MAX)
+        else:
+            delay = min(RECONNECT_BACKOFF_BASE ** attempt, RECONNECT_BACKOFF_MAX)
+        return delay + random.uniform(0, 1)
+
     async def _reconnect(self) -> None:
         while True:
             self._reconnect_attempts += 1
-            delay = min(
-                RECONNECT_BACKOFF_BASE ** self._reconnect_attempts
-                + random.uniform(0, 1),
-                RECONNECT_BACKOFF_MAX,
-            )
+            delay = self._backoff_delay(self._reconnect_attempts)
             _LOGGER.debug(
                 "Reconnect attempt %d in %.1fs for %s:%s",
                 self._reconnect_attempts, delay, self._host, self._port,
@@ -299,14 +308,22 @@ class OrisecCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 await self._do_config()
                 await self._do_initial_data()
                 self._stage = 3
-                self._reconnect_attempts = 0
                 _LOGGER.info(
                     "Reconnected to %s:%s after %d attempts",
-                    self._host, self._port, self._reconnect_attempts + 1,
+                    self._host, self._port, self._reconnect_attempts,
                 )
+                self._reconnect_attempts = 0
+                self._last_error_refused = False
                 self.async_set_updated_data(self._build_data_dict())
                 return
+            except PanelRefusedError as err:
+                self._last_error_refused = True
+                _LOGGER.warning(
+                    "%s; backing off before attempt %d",
+                    err, self._reconnect_attempts + 1,
+                )
             except (ConnectionError, OSError, asyncio.TimeoutError, UpdateFailed) as err:
+                self._last_error_refused = False
                 _LOGGER.debug("Reconnect attempt %d failed: %s", self._reconnect_attempts, err)
 
     def _start_reconnect(self) -> None:
@@ -392,6 +409,7 @@ class OrisecCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         except Exception as err:
             self._stage = 0
+            self._last_error_refused = isinstance(err, PanelRefusedError)
             self._start_reconnect()
             if isinstance(err, UpdateFailed):
                 raise
