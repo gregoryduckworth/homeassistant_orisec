@@ -15,7 +15,7 @@ Communicates directly with the panel over UDP on port 20202 — no cloud, no int
 - **Remote outputs** — Switch entities for all remote outputs (disabled by default)
 - **Panel diagnostics** — Sensor with panel type, version, serial, and connection state
 - **Alarm events** — Fires `orisec_alarm_triggered` / `orisec_alarm_cleared` / `orisec_state_changed` on the HA event bus
-- **Fast polling** — 2-second update interval via lightweight UDP packets
+- **Polling** — 5-second update interval via lightweight UDP packets (2 seconds while the keypad card is open)
 - **Auto-reconnect** — If communication fails, the integration reconnects automatically on the next poll
 - **Custom Lovelace cards** — `orisec-alarm-panel-card` and `orisec-keypad-card` auto-registered; shows your panel's arm-mode names
 - **Sidebar panel** — Auto-registered "Orisec" sidebar item with alarm controls and keypad in one page
@@ -302,7 +302,7 @@ The integration communicates with the panel using its native binary UDP protocol
 
 1. **Login** — Sends password, receives panel info, capabilities, and user area mask
 2. **Setup** — Queries zone types, names, area names, output names, part-arm mode names
-3. **Poll** — Every 2 seconds: reads system output states (arm/alarm/ready flags), zone status (open/tamper), zone timers, and remote output states in a single multi-query
+3. **Poll** — Every 5 seconds (2 while the keypad card is open): reads system output states (arm/alarm/ready flags), zone status (open/tamper), zone timers, and remote output states in a single multi-query
 4. **Commands** — Arm/disarm sends keypress codes; output toggle sends control commands
 
 All communication is local UDP. See [docs/PROTOCOL.md](docs/PROTOCOL.md) for full protocol details.

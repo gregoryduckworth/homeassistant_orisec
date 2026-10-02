@@ -15,6 +15,7 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 from .const import (
     CONFIG_FLOW_GRACE_PERIOD,
     DOMAIN,
+    KEYPAD_POLL_INTERVAL,
     POLL_INTERVAL,
     RECONNECT_BACKOFF_BASE,
     RECONNECT_BACKOFF_MAX,
@@ -593,12 +594,15 @@ class OrisecCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     def keypad_subscribe(self, send_callback: Callable) -> Callable:
         self._keypad_subscribers += 1
         self._lcd_callbacks.append(send_callback)
+        self.update_interval = timedelta(seconds=KEYPAD_POLL_INTERVAL)
         send_callback(self._get_lcd_state())
 
         def unsubscribe() -> None:
             self._keypad_subscribers = max(0, self._keypad_subscribers - 1)
             if send_callback in self._lcd_callbacks:
                 self._lcd_callbacks.remove(send_callback)
+            if self._keypad_subscribers == 0:
+                self.update_interval = timedelta(seconds=POLL_INTERVAL)
 
         return unsubscribe
 

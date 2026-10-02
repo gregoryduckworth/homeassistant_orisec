@@ -106,7 +106,7 @@ The `OrisecCoordinator` extends Home Assistant's `DataUpdateCoordinator` and man
 
 1. **Connection lifecycle** — connect, login, reconnect on failure
 2. **Initial data load** — zone types, names, areas, area names, output names, part-arm texts
-3. **Polling** — every 2 seconds:
+3. **Polling** — every 5 seconds (2 while a keypad card is subscribed):
    - System output states (65 bytes — alarm/arm status)
    - Panel state (user info, log pointer)
    - Zone status (open/tamper per zone)

@@ -525,5 +525,24 @@ class TestRefusedBackoff(unittest.TestCase):
         run_async(_test())
 
 
+class TestPollInterval(unittest.TestCase):
+
+    def test_polls_faster_only_while_keypad_open(self):
+        from datetime import timedelta
+        from custom_components.orisec.const import KEYPAD_POLL_INTERVAL, POLL_INTERVAL
+
+        coord = OrisecCoordinator(MagicMock(), "127.0.0.1", 44444, "1234")
+        self.assertEqual(coord.update_interval, timedelta(seconds=POLL_INTERVAL))
+
+        unsub_a = coord.keypad_subscribe(lambda state: None)
+        unsub_b = coord.keypad_subscribe(lambda state: None)
+        self.assertEqual(coord.update_interval, timedelta(seconds=KEYPAD_POLL_INTERVAL))
+
+        unsub_a()
+        self.assertEqual(coord.update_interval, timedelta(seconds=KEYPAD_POLL_INTERVAL))
+        unsub_b()
+        self.assertEqual(coord.update_interval, timedelta(seconds=POLL_INTERVAL))
+
+
 if __name__ == "__main__":
     unittest.main()
