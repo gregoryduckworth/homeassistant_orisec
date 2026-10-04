@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import logging
 import struct
+import zlib
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -20,6 +22,8 @@ from .const import (
     CMD_SYS_CONFIG,
     CRC16_INIT,
     CRC16_TABLE,
+    LOCAL_PORT_BASE,
+    LOCAL_PORT_RANGE,
     PANEL_TYPE_MAP,
     QUERY_AREA_ARM_ATT,
     QUERY_AREA_ARM_MODE,
@@ -428,12 +432,18 @@ class OrisecUDPProtocol(asyncio.DatagramProtocol):
         pass
 
 
+def local_port_for(host: str, port: int) -> int:
+    return LOCAL_PORT_BASE + zlib.crc32(f"{host}:{port}".encode()) % LOCAL_PORT_RANGE
+
+
 class OrisecConnection:
 
     def __init__(self, host: str, port: int, timeout: float = UDP_TIMEOUT) -> None:
         self.host = host
         self.port = port
         self.timeout = timeout
+        # The panel locks onto one client ip:port and refuses others until it times out.
+        self.local_port = local_port_for(host, port)
         self._transport: asyncio.DatagramTransport | None = None
         self._protocol: OrisecUDPProtocol | None = None
 
@@ -441,9 +451,27 @@ class OrisecConnection:
         if self.connected:
             return
         loop = asyncio.get_running_loop()
-        self._transport, self._protocol = await loop.create_datagram_endpoint(
-            OrisecUDPProtocol,
-            remote_addr=(self.host, self.port),
+        try:
+            self._transport, self._protocol = await loop.create_datagram_endpoint(
+                OrisecUDPProtocol,
+                local_addr=("0.0.0.0", self.local_port),
+                remote_addr=(self.host, self.port),
+            )
+        except OSError as err:
+            if err.errno != errno.EADDRINUSE:
+                raise
+            _LOGGER.warning(
+                "Local UDP port %d is in use; connecting to %s:%s from a random "
+                "port instead, which the panel may refuse as a new client",
+                self.local_port, self.host, self.port,
+            )
+            self._transport, self._protocol = await loop.create_datagram_endpoint(
+                OrisecUDPProtocol,
+                remote_addr=(self.host, self.port),
+            )
+        _LOGGER.debug(
+            "UDP socket %s -> %s:%s",
+            self._transport.get_extra_info("sockname"), self.host, self.port,
         )
 
     async def disconnect(self) -> None:

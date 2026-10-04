@@ -313,7 +313,8 @@ All communication is local UDP. See [docs/PROTOCOL.md](docs/PROTOCOL.md) for ful
 |---------|----------|
 | "Cannot connect" at startup | Integration retries automatically. Check panel IP is reachable (`ping`) and port 20202 is not firewalled. |
 | "Invalid password" | Use the same PIN as your ControlPlus2 mobile app. |
-| Entities show unavailable | Panel may have rebooted. The integration auto-reconnects on the next poll cycle. |
+| Entities show unavailable | Panel may have rebooted. The integration auto-reconnects in the background with backoff. |
+| "Refused the connection (nothing listening on that port)" | The panel's IP module only talks to one client at a time and is still holding an old session. The integration always connects from the same local UDP port (21000–21999, derived from the panel address) to avoid this; if it persists, wait for the session to expire or restart the IP module by unplugging its network cable for 30 seconds. |
 | Zones missing | Only zones with a name and type ≠ "Not Used" create entities. |
 | Part Set buttons missing | Your panel may not have part-arm modes configured. Check `part_arm_mask` attribute on the alarm entity. |
 | Arm command ignored | Your user PIN may not have access to that area. Check `user_area` in panel diagnostics. |

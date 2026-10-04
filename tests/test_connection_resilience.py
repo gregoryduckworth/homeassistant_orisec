@@ -525,6 +525,56 @@ class TestRefusedBackoff(unittest.TestCase):
         run_async(_test())
 
 
+class TestFixedLocalPort(unittest.TestCase):
+
+    def test_local_port_is_stable_and_in_range(self):
+        from custom_components.orisec.const import LOCAL_PORT_BASE, LOCAL_PORT_RANGE
+        from custom_components.orisec.protocol import local_port_for
+
+        port = local_port_for("192.168.1.15", 10101)
+        self.assertEqual(port, local_port_for("192.168.1.15", 10101))
+        self.assertTrue(LOCAL_PORT_BASE <= port < LOCAL_PORT_BASE + LOCAL_PORT_RANGE)
+
+    def test_new_connection_reuses_same_local_port(self):
+        async def _test():
+            first = OrisecConnection("127.0.0.1", 44444)
+            await first.connect()
+            port_a = first._transport.get_extra_info("sockname")[1]
+            await first.disconnect()
+            await asyncio.sleep(0)
+
+            # A fresh connection object stands in for HA restarting.
+            second = OrisecConnection("127.0.0.1", 44444)
+            await second.connect()
+            try:
+                port_b = second._transport.get_extra_info("sockname")[1]
+            finally:
+                await second.disconnect()
+
+            self.assertEqual(port_a, first.local_port)
+            self.assertEqual(port_a, port_b)
+
+        run_async(_test())
+
+    def test_falls_back_to_random_port_when_in_use(self):
+        async def _test():
+            holder = OrisecConnection("127.0.0.1", 44444)
+            await holder.connect()
+            other = OrisecConnection("127.0.0.1", 44444)
+            try:
+                with self.assertLogs("custom_components.orisec.protocol", "WARNING"):
+                    await other.connect()
+                self.assertTrue(other.connected)
+                self.assertNotEqual(
+                    other._transport.get_extra_info("sockname")[1], holder.local_port
+                )
+            finally:
+                await other.disconnect()
+                await holder.disconnect()
+
+        run_async(_test())
+
+
 class TestPollInterval(unittest.TestCase):
 
     def test_polls_faster_only_while_keypad_open(self):
