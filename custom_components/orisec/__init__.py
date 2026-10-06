@@ -68,6 +68,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     try:
         await coordinator.async_setup()
     except (ConnectionError, OSError, asyncio.TimeoutError, UpdateFailed) as err:
+        # Release the fixed local port, or HA's retry falls back to a random one the panel refuses.
+        await coordinator.async_shutdown()
         _LOGGER.warning(
             "Failed to connect to Orisec panel at %s:%s: %s", host, port, err,
         )
