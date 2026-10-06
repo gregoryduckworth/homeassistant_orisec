@@ -290,6 +290,50 @@ class TestConfigEntryNotReady(unittest.TestCase):
 
         run_async(_test())
 
+    def test_failed_setup_releases_local_port_for_retry(self):
+        async def _test():
+            from custom_components.orisec import async_setup_entry
+            from custom_components.orisec.const import CONF_PANEL_IP, CONF_PANEL_PORT, CONF_PASSWORD
+
+            hass = MagicMock()
+            hass.data = {}
+            hass.http = AsyncMock()
+            hass.config_entries = AsyncMock()
+            entry = MagicMock()
+            entry.data = {
+                CONF_PANEL_IP: "127.0.0.1",
+                CONF_PANEL_PORT: 44444,
+                CONF_PASSWORD: "1234",
+            }
+
+            async def connect_then_refuse(coord):
+                await coord._conn.connect()
+                raise PanelRefusedError("refused")
+
+            with patch(
+                "custom_components.orisec.OrisecCoordinator.async_setup",
+                autospec=True,
+                side_effect=connect_then_refuse,
+            ), patch(
+                "custom_components.orisec.async_register_panel",
+                new_callable=AsyncMock,
+            ):
+                with self.assertRaises(_ConfigEntryNotReady):
+                    await async_setup_entry(hass, entry)
+            await asyncio.sleep(0)
+
+            # HA's retry builds a fresh connection; it must get the fixed port back.
+            retry = OrisecConnection("127.0.0.1", 44444)
+            await retry.connect()
+            try:
+                self.assertEqual(
+                    retry._transport.get_extra_info("sockname")[1], retry.local_port
+                )
+            finally:
+                await retry.disconnect()
+
+        run_async(_test())
+
 
 class TestReconnectLoop(unittest.TestCase):
 
