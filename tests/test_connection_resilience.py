@@ -18,6 +18,7 @@ _ha_ce = types.ModuleType("homeassistant.config_entries")
 _ha_huc = types.ModuleType("homeassistant.helpers.update_coordinator")
 _ha_helpers = types.ModuleType("homeassistant.helpers")
 _ha_ep = types.ModuleType("homeassistant.helpers.entity_platform")
+_ha_storage = types.ModuleType("homeassistant.helpers.storage")
 _ha_const = types.ModuleType("homeassistant.const")
 _ha_exc = types.ModuleType("homeassistant.exceptions")
 _ha_comp = types.ModuleType("homeassistant.components")
@@ -54,6 +55,30 @@ class _UpdateFailed(Exception):
     pass
 
 
+class _FakeStore:
+    """In-memory stand-in for homeassistant.helpers.storage.Store, keyed like the real one."""
+
+    saved: dict[str, dict] = {}
+
+    def __class_getitem__(cls, item):
+        return cls
+
+    def __init__(self, hass, version, key):
+        self.key = key
+
+    async def async_load(self):
+        return self.saved.get(self.key)
+
+    async def async_save(self, data):
+        self.saved[self.key] = data
+
+    def async_delay_save(self, data_func, delay=0):
+        self.saved[self.key] = data_func()
+
+    async def async_remove(self):
+        self.saved.pop(self.key, None)
+
+
 _ha_ce.ConfigEntry = _FakeConfigEntry
 _ha_ce.ConfigFlow = type("ConfigFlow", (), {"domain": ""})
 _ha_ce.ConfigFlowResult = type("ConfigFlowResult", (), {})
@@ -62,6 +87,7 @@ _ha_core.callback = lambda f: f
 _ha_huc.DataUpdateCoordinator = _FakeDataUpdateCoordinator
 _ha_huc.UpdateFailed = _UpdateFailed
 _ha_ep.AddEntitiesCallback = None
+_ha_storage.Store = _FakeStore
 _ha_const.CONF_HOST = "host"
 _ha_const.CONF_PORT = "port"
 _ha_const.CONF_PASSWORD = "password"
@@ -85,6 +111,7 @@ for mod_name, mod in [
     ("homeassistant.helpers", _ha_helpers),
     ("homeassistant.helpers.update_coordinator", _ha_huc),
     ("homeassistant.helpers.entity_platform", _ha_ep),
+    ("homeassistant.helpers.storage", _ha_storage),
     ("homeassistant.const", _ha_const),
     ("homeassistant.exceptions", _ha_exc),
     ("homeassistant.components", _ha_comp),
@@ -99,7 +126,9 @@ for mod_name, mod in [
 from custom_components.orisec.protocol import (
     OrisecConnection,
     OrisecUDPProtocol,
+    PanelNoResponseError,
     PanelRefusedError,
+    ParsedResponse,
 )
 from custom_components.orisec.coordinator import OrisecCoordinator
 from custom_components.orisec.const import SEND_RETRIES
@@ -131,8 +160,8 @@ class TestSendReceiveRetry(unittest.TestCase):
 
             from custom_components.orisec.protocol import load_udl_pkt
             pkt = load_udl_pkt(1, 1, 1)
-            responses = await conn.send_receive(pkt, settle_time=0.01)
-            self.assertEqual(responses, [])
+            with self.assertRaises(PanelNoResponseError):
+                await conn.send_receive(pkt, settle_time=0.01)
             self.assertEqual(send_count, SEND_RETRIES)
 
         run_async(_test())
@@ -636,6 +665,248 @@ class TestPollInterval(unittest.TestCase):
         self.assertEqual(coord.update_interval, timedelta(seconds=KEYPAD_POLL_INTERVAL))
         unsub_b()
         self.assertEqual(coord.update_interval, timedelta(seconds=POLL_INTERVAL))
+
+
+
+def _connected_coordinator() -> OrisecCoordinator:
+    coord = OrisecCoordinator(MagicMock(), "127.0.0.1", 44444, "1234")
+    coord._conn._transport = MagicMock()
+    coord._conn._transport.is_closing.return_value = False
+    coord._conn._protocol = OrisecUDPProtocol()
+    coord._stage = 3
+    coord.max_zones = 10
+    coord._start_reconnect = MagicMock()
+    return coord
+
+
+def _status_response(armed_mask: int) -> ParsedResponse:
+    from custom_components.orisec.const import QUERY_SYS_OUTPUT_STATE, SOS_ARMED
+
+    result = ParsedResponse()
+    result.commands.append({"cmd": QUERY_SYS_OUTPUT_STATE})
+    result.sys_output_state[SOS_ARMED] = armed_mask
+    return result
+
+
+class TestSocketLock(unittest.TestCase):
+
+    def test_concurrent_requests_each_get_their_own_reply(self):
+        async def _test():
+            from custom_components.orisec.protocol import load_udl_pkt, trim_packet
+
+            conn = OrisecConnection("127.0.0.1", 44444, timeout=1.0)
+            proto = OrisecUDPProtocol()
+            conn._protocol = proto
+            conn._transport = MagicMock()
+            conn._transport.is_closing.return_value = False
+            loop = asyncio.get_event_loop()
+            # The panel echoes each request back after a short delay.
+            conn._transport.sendto = lambda data: loop.call_later(
+                0.02, proto.datagram_received, data, ("127.0.0.1", 44444)
+            )
+
+            pkt_a, pkt_b = load_udl_pkt(10, 1, 1), load_udl_pkt(20, 1, 1)
+            replies_a, replies_b = await asyncio.gather(
+                conn.send_receive(pkt_a, settle_time=0.01),
+                conn.send_receive(pkt_b, settle_time=0.01),
+            )
+            self.assertEqual(replies_a, [trim_packet(pkt_a)])
+            self.assertEqual(replies_b, [trim_packet(pkt_b)])
+
+        run_async(_test())
+
+
+class TestPollRejectsMissingStatus(unittest.TestCase):
+
+    def test_reply_without_status_keeps_last_state_and_reconnects(self):
+        async def _test():
+            from custom_components.orisec.const import SOS_ARMED
+
+            coord = _connected_coordinator()
+            coord.sys_output_state[SOS_ARMED] = 0x01
+            coord._conn.multi_query = AsyncMock(return_value=ParsedResponse(error=1))
+
+            with self.assertRaises(_UpdateFailed):
+                await coord._async_update_data()
+            self.assertEqual(coord.sys_output_state[SOS_ARMED], 0x01)
+            self.assertEqual(coord._stage, 0)
+            coord._start_reconnect.assert_called_once()
+
+        run_async(_test())
+
+    def test_unanswered_poll_keeps_last_state_and_reconnects(self):
+        async def _test():
+            from custom_components.orisec.const import SOS_ARMED
+
+            coord = _connected_coordinator()
+            coord.sys_output_state[SOS_ARMED] = 0x01
+            coord._conn.multi_query = AsyncMock(side_effect=PanelNoResponseError("silent"))
+
+            with self.assertRaises(_UpdateFailed):
+                await coord._async_update_data()
+            self.assertEqual(coord.sys_output_state[SOS_ARMED], 0x01)
+            coord._start_reconnect.assert_called_once()
+
+        run_async(_test())
+
+    def test_reply_with_status_updates_state(self):
+        async def _test():
+            from custom_components.orisec.const import SOS_ARMED
+
+            coord = _connected_coordinator()
+            coord._conn.multi_query = AsyncMock(return_value=_status_response(0x01))
+
+            await coord._async_update_data()
+            self.assertEqual(coord.sys_output_state[SOS_ARMED], 0x01)
+            coord._start_reconnect.assert_not_called()
+
+        run_async(_test())
+
+
+class TestReconnectLoad(unittest.TestCase):
+
+    def _coordinator(self) -> OrisecCoordinator:
+        coord = OrisecCoordinator(MagicMock(), "127.0.0.1", 44444, "1234")
+        coord._conn.connect = AsyncMock()
+        coord._do_login = AsyncMock()
+        coord._do_config = AsyncMock()
+        coord._do_initial_data = AsyncMock()
+        coord._do_status = AsyncMock()
+        coord.on_metadata_updated = MagicMock()
+        return coord
+
+    def test_first_connect_loads_metadata_and_reports_it(self):
+        async def _test():
+            coord = self._coordinator()
+            with patch("custom_components.orisec.coordinator.asyncio.sleep", new_callable=AsyncMock):
+                await coord._reconnect()
+
+            coord._do_initial_data.assert_awaited_once()
+            coord._do_status.assert_not_awaited()
+            coord.on_metadata_updated.assert_called_once()
+
+        run_async(_test())
+
+    def test_reconnect_skips_metadata_once_loaded(self):
+        async def _test():
+            coord = self._coordinator()
+            coord._metadata_fresh = True
+            with patch("custom_components.orisec.coordinator.asyncio.sleep", new_callable=AsyncMock):
+                await coord._reconnect()
+
+            coord._do_status.assert_awaited_once()
+            coord._do_initial_data.assert_not_awaited()
+            coord.on_metadata_updated.assert_not_called()
+            self.assertEqual(coord._stage, 3)
+
+        run_async(_test())
+
+    def test_status_reply_without_status_block_fails_reconnect_attempt(self):
+        async def _test():
+            coord = OrisecCoordinator(MagicMock(), "127.0.0.1", 44444, "1234")
+            coord._conn.multi_query = AsyncMock(return_value=ParsedResponse())
+            with self.assertRaises(_UpdateFailed):
+                await coord._do_status()
+
+        run_async(_test())
+
+
+class TestMetadataCache(unittest.TestCase):
+
+    def setUp(self):
+        _FakeStore.saved.clear()
+
+    @staticmethod
+    def _entry(entry_id: str):
+        from custom_components.orisec.const import CONF_PANEL_IP, CONF_PANEL_PORT, CONF_PASSWORD
+
+        entry = MagicMock()
+        entry.entry_id = entry_id
+        entry.data = {CONF_PANEL_IP: "127.0.0.1", CONF_PANEL_PORT: 44444, CONF_PASSWORD: "1234"}
+        return entry
+
+    @staticmethod
+    def _hass():
+        hass = MagicMock()
+        hass.data = {}
+        hass.http = AsyncMock()
+        hass.config_entries = AsyncMock()
+        hass.async_create_task = lambda coro, name=None: asyncio.ensure_future(coro)
+        return hass
+
+    def test_metadata_round_trips_through_json(self):
+        import json
+
+        coord = OrisecCoordinator(MagicMock(), "127.0.0.1", 44444, "1234")
+        coord.panel_type, coord.serial = "CP20", "ABC123"
+        coord.max_zones, coord.max_areas, coord.max_rem_outputs = 20, 2, 4
+        coord.zone_names = ["Front Door", "Hall PIR"]
+        coord.area_names = ["House", "Garage"]
+        coord.zone_types, coord.zone_areas = bytes([1, 2, 0]), bytes([1, 1, 2])
+
+        restored = OrisecCoordinator(MagicMock(), "127.0.0.1", 44444, "1234")
+        restored.restore_metadata(json.loads(json.dumps(coord.export_metadata())))
+
+        self.assertEqual(restored.export_metadata(), coord.export_metadata())
+        self.assertEqual(restored.zone_types, bytes([1, 2, 0]))
+        self.assertFalse(restored._metadata_fresh)
+
+    def test_first_setup_caches_panel_configuration(self):
+        async def _test():
+            from custom_components.orisec import async_setup_entry
+
+            async def fake_initial_data(coord):
+                coord.zone_names = ["Front Door"]
+
+            hass, entry = self._hass(), self._entry("first_setup")
+            with patch.object(OrisecConnection, "connect", AsyncMock()), patch.object(
+                OrisecCoordinator, "_do_login", AsyncMock()
+            ), patch.object(OrisecCoordinator, "_do_config", AsyncMock()), patch.object(
+                OrisecCoordinator, "_do_initial_data", autospec=True, side_effect=fake_initial_data
+            ), patch(
+                "custom_components.orisec.coordinator.asyncio.sleep", new_callable=AsyncMock
+            ), patch("custom_components.orisec.async_register_panel", new_callable=AsyncMock):
+                await async_setup_entry(hass, entry)
+
+            self.assertEqual(_FakeStore.saved["orisec.first_setup"]["zone_names"], ["Front Door"])
+
+        run_async(_test())
+
+    def test_cached_setup_starts_without_panel_and_connects_in_background(self):
+        async def _test():
+            from custom_components.orisec import async_setup_entry
+            from custom_components.orisec.const import DOMAIN
+
+            _FakeStore.saved["orisec.cached"] = {"max_zones": 20, "zone_names": ["Front Door"]}
+            hass, entry = self._hass(), self._entry("cached")
+
+            with patch(
+                "custom_components.orisec.OrisecCoordinator.async_setup", new_callable=AsyncMock
+            ) as setup, patch("custom_components.orisec.async_register_panel", new_callable=AsyncMock):
+                self.assertTrue(await async_setup_entry(hass, entry))
+
+            coord = hass.data[DOMAIN]["cached"]
+            try:
+                setup.assert_not_awaited()
+                self.assertEqual(coord.max_zones, 20)
+                self.assertEqual(coord.zone_names, ["Front Door"])
+                self.assertFalse(coord.last_update_success)
+                self.assertFalse(coord._reconnect_task.done())
+                hass.config_entries.async_forward_entry_setups.assert_awaited_once()
+            finally:
+                await coord.async_shutdown()
+
+        run_async(_test())
+
+    def test_removing_entry_deletes_cache(self):
+        async def _test():
+            from custom_components.orisec import async_remove_entry
+
+            _FakeStore.saved["orisec.gone"] = {"max_zones": 20}
+            await async_remove_entry(self._hass(), self._entry("gone"))
+            self.assertNotIn("orisec.gone", _FakeStore.saved)
+
+        run_async(_test())
 
 
 if __name__ == "__main__":

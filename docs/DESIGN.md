@@ -124,7 +124,11 @@ Stage 3: Initial data load (zone names, types, areas, outputs, part arm texts)
 Stage 4: Polling (continuous 2-second interval)
 ```
 
-On communication failure, the coordinator disconnects and attempts reconnection on the next poll cycle.
+On communication failure (no reply after retries, or a reply missing the system output state block) the coordinator keeps the last known state, marks entities unavailable, and starts a background reconnect loop with backoff. Reconnects only re-run stages 1, 2 and a status read; zone/area names are not re-downloaded once loaded.
+
+Requests share one UDP socket and replies carry no request id, so `OrisecConnection` serialises requests with a lock.
+
+The panel configuration (stage 3 metadata) is cached in HA storage (`.storage/orisec.<entry_id>`). When a cache exists, setup builds entities from it without contacting the panel and connects in the background; the first successful connection refreshes the cache. Only the first setup (no cache) blocks on the panel and raises `ConfigEntryNotReady` if it is unreachable.
 
 ## Protocol Layer
 
