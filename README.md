@@ -16,7 +16,8 @@ Communicates directly with the panel over UDP on port 20202 — no cloud, no int
 - **Panel diagnostics** — Sensor with panel type, version, serial, and connection state
 - **Alarm events** — Fires `orisec_alarm_triggered` / `orisec_alarm_cleared` / `orisec_state_changed` on the HA event bus
 - **Polling** — 5-second update interval via lightweight UDP packets (2 seconds while the keypad card is open)
-- **Auto-reconnect** — If communication fails, the integration reconnects automatically on the next poll
+- **Auto-reconnect** — If communication fails, the integration logs back in automatically in the background; a poll the panel doesn't answer is treated as a failure, never as "disarmed"
+- **Survives restarts** — The panel's zone/area configuration is cached, so after an HA restart entities are created immediately and come online as soon as the panel answers
 - **Custom Lovelace cards** — `orisec-alarm-panel-card` and `orisec-keypad-card` auto-registered; shows your panel's arm-mode names
 - **Sidebar panel** — Auto-registered "Orisec" sidebar item with alarm controls and keypad in one page
 
@@ -301,7 +302,7 @@ This performs comprehensive read-only queries and does **not** arm, disarm, or m
 The integration communicates with the panel using its native binary UDP protocol:
 
 1. **Login** — Sends password, receives panel info, capabilities, and user area mask
-2. **Setup** — Queries zone types, names, area names, output names, part-arm mode names
+2. **Setup** — Queries zone types, names, area names, output names, part-arm mode names (cached in HA storage, so later restarts don't wait for the panel)
 3. **Poll** — Every 5 seconds (2 while the keypad card is open): reads system output states (arm/alarm/ready flags), zone status (open/tamper), zone timers, and remote output states in a single multi-query
 4. **Commands** — Arm/disarm sends keypress codes; output toggle sends control commands
 
@@ -311,9 +312,10 @@ All communication is local UDP. See [docs/PROTOCOL.md](docs/PROTOCOL.md) for ful
 
 | Problem | Solution |
 |---------|----------|
-| "Cannot connect" at startup | Integration retries automatically. Check panel IP is reachable (`ping`) and port 20202 is not firewalled. |
+| "Cannot connect" at startup | Integration retries automatically. Check panel IP is reachable (`ping`) and port 20202 is not firewalled. Only the very first setup needs the panel; after that HA starts from the cached configuration. |
 | "Invalid password" | Use the same PIN as your ControlPlus2 mobile app. |
 | Entities show unavailable | Panel may have rebooted. The integration auto-reconnects in the background with backoff. |
+| New zones/outputs not appearing | Entities are built from the cached configuration at startup. The cache refreshes once the panel connects; reload the integration to pick up added zones or outputs. |
 | "Refused the connection (nothing listening on that port)" | The panel's IP module only talks to one client at a time and is still holding an old session. The integration always connects from the same local UDP port (21000–21999, derived from the panel address) to avoid this; if it persists, wait for the session to expire or restart the IP module by unplugging its network cable for 30 seconds. |
 | Zones missing | Only zones with a name and type ≠ "Not Used" create entities. |
 | Part Set buttons missing | Your panel may not have part-arm modes configured. Check `part_arm_mask` attribute on the alarm entity. |

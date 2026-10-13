@@ -206,6 +206,9 @@ class ParsedResponse:
     panel_time: list[int] = field(default_factory=lambda: [0, 0, 0])
     commands: list[dict[str, Any]] = field(default_factory=list)
 
+    def has_command(self, cmd: int) -> bool:
+        return any(c["cmd"] == cmd for c in self.commands)
+
 
 def _parse_null_terminated_strings(payload: bytes, data_len: int) -> list[str]:
     names: list[str] = []
@@ -408,6 +411,10 @@ class PanelRefusedError(ConnectionError):
     """The panel answered with ICMP port-unreachable; retrying quickly won't help."""
 
 
+class PanelNoResponseError(ConnectionError):
+    """The panel never answered a request, even after retries."""
+
+
 class OrisecUDPProtocol(asyncio.DatagramProtocol):
 
     def __init__(self) -> None:
@@ -446,6 +453,8 @@ class OrisecConnection:
         self.local_port = local_port_for(host, port)
         self._transport: asyncio.DatagramTransport | None = None
         self._protocol: OrisecUDPProtocol | None = None
+        # Replies carry no request id, so only one request may be in flight at a time.
+        self._lock = asyncio.Lock()
 
     async def connect(self) -> None:
         if self.connected:
@@ -486,6 +495,12 @@ class OrisecConnection:
 
     async def send_receive(
         self, packet: bytearray | bytes, settle_time: float = 0.2
+    ) -> list[bytes]:
+        async with self._lock:
+            return await self._send_receive(packet, settle_time)
+
+    async def _send_receive(
+        self, packet: bytearray | bytes, settle_time: float
     ) -> list[bytes]:
         if self._transport is None or self._protocol is None:
             raise ConnectionError("Not connected")
@@ -536,13 +551,14 @@ class OrisecConnection:
         )
         if isinstance(last_error, ConnectionError):
             raise last_error
-        return []
+        raise PanelNoResponseError(
+            f"No response from panel at {self.host}:{self.port} "
+            f"after {SEND_RETRIES} attempts"
+        )
 
     async def login(self, password: str) -> ParsedResponse:
         pkt = build_login_packet(password)
         responses = await self.send_receive(pkt)
-        if not responses:
-            raise ConnectionError("No response from panel during login")
         return parse_responses(responses)
 
     async def query(self, cmd: int, start: int, count: int) -> ParsedResponse:

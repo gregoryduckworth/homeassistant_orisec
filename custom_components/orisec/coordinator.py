@@ -85,6 +85,14 @@ _LOGGER = logging.getLogger(__name__)
 
 SETUP_RETRY_DELAY = 5
 
+# Panel configuration that shapes the entities; cached so HA can start without the panel.
+_METADATA_FIELDS = (
+    "panel_type", "panel_version", "serial", "max_zones", "max_areas",
+    "max_rem_outputs", "part_arm_mask", "user_area", "user_number",
+    "zone_names", "area_names", "rem_output_names", "part_arm_names",
+)
+_METADATA_BYTES_FIELDS = ("zone_types", "zone_areas")
+
 
 class OrisecCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
@@ -147,6 +155,10 @@ class OrisecCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._reconnect_attempts: int = 0
         self._last_error_refused: bool = False
 
+        # False until names/types are read from the panel in this run (a cache restore doesn't count).
+        self._metadata_fresh: bool = False
+        self.on_metadata_updated: Callable[[], None] | None = None
+
     @property
     def host(self) -> str:
         return self._host
@@ -165,11 +177,7 @@ class OrisecCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 )
                 if attempt == 1:
                     await asyncio.sleep(CONFIG_FLOW_GRACE_PERIOD)
-                await self._conn.connect()
-                await self._do_login()
-                await self._do_config()
-                await self._do_initial_data()
-                self._stage = 3
+                await self._connect_and_load()
                 _LOGGER.debug("Setup succeeded on attempt %d", attempt)
                 return
             except PanelRefusedError:
@@ -187,6 +195,20 @@ class OrisecCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     _LOGGER.debug("Retrying in %.1fs", delay)
                     await asyncio.sleep(delay)
         raise last_err  # type: ignore[misc]
+
+    async def _connect_and_load(self) -> None:
+        await self._conn.connect()
+        await self._do_login()
+        await self._do_config()
+        if self._metadata_fresh:
+            # Names don't change between reconnects; only fetch live state.
+            await self._do_status()
+        else:
+            await self._do_initial_data()
+            self._metadata_fresh = True
+            if self.on_metadata_updated is not None:
+                self.on_metadata_updated()
+        self._stage = 3
 
     async def _do_login(self) -> None:
         result = await self._conn.login(self._password)
@@ -284,8 +306,45 @@ class OrisecCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             (QUERY_ZONE_STATUS, 1, self.max_zones),
         ])
         self.part_arm_names = r.part_arm_names
-        self.sys_output_state = r.sys_output_state
-        self.zone_status = r.zone_status
+        self._apply_status(r)
+
+    async def _do_status(self) -> None:
+        r = await self._conn.multi_query([
+            (QUERY_SYS_OUTPUT_STATE, 1, 65),
+            (CMD_PANEL_STATE, 1, 1),
+            (QUERY_ZONE_STATUS, 1, self.max_zones),
+        ])
+        self._apply_status(r)
+
+    def _apply_status(self, result: ParsedResponse) -> None:
+        # A reply without the status block (e.g. an expired login) must not read as all-zero state.
+        if not result.has_command(QUERY_SYS_OUTPUT_STATE):
+            raise UpdateFailed(
+                f"Panel replied without status data (error={result.error})"
+            )
+        self.sys_output_state = result.sys_output_state
+        if result.zone_status:
+            self.zone_status = result.zone_status
+
+    def export_metadata(self) -> dict[str, Any]:
+        data: dict[str, Any] = {f: getattr(self, f) for f in _METADATA_FIELDS}
+        data.update({f: list(getattr(self, f)) for f in _METADATA_BYTES_FIELDS})
+        return data
+
+    def restore_metadata(self, data: dict[str, Any]) -> None:
+        for f in _METADATA_FIELDS:
+            if f in data:
+                setattr(self, f, data[f])
+        for f in _METADATA_BYTES_FIELDS:
+            if f in data:
+                setattr(self, f, bytes(data[f]))
+
+    @callback
+    def async_connect_in_background(self) -> None:
+        """Start with entities unavailable and keep trying the panel until it answers."""
+        self._stage = 0
+        self.last_update_success = False
+        self._start_reconnect()
 
     def _backoff_delay(self, attempt: int) -> float:
         if self._last_error_refused:
@@ -304,11 +363,7 @@ class OrisecCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             )
             await asyncio.sleep(delay)
             try:
-                await self._conn.connect()
-                await self._do_login()
-                await self._do_config()
-                await self._do_initial_data()
-                self._stage = 3
+                await self._connect_and_load()
                 _LOGGER.info(
                     "Reconnected to %s:%s after %d attempts",
                     self._host, self._port, self._reconnect_attempts,
@@ -385,11 +440,9 @@ class OrisecCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._poll_index += 1
 
             result = await self._conn.multi_query(queries)
+            self._apply_status(result)
 
             self._reconnect_attempts = 0
-            self.sys_output_state = result.sys_output_state
-            if result.zone_status:
-                self.zone_status = result.zone_status
             if result.zone_timers:
                 self.zone_timers = result.zone_timers
             if result.zone_bypass:
