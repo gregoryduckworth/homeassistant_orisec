@@ -71,6 +71,7 @@ class OrisecPanelInfoSensor(CoordinatorEntity[OrisecCoordinator], SensorEntity):
             "trouble": bool(sos[SOS_TROUBLE] & 0xFF) if sos else False,
             "engineer_required": bool(sos[SOS_CALL_ENGINEER] & 0xFF) if sos else False,
         }
+        attrs.update(self.coordinator.connection_stats)
 
         if self.coordinator.area_names:
             for i, name in enumerate(self.coordinator.area_names):

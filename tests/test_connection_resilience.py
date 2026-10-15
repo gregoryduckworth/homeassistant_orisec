@@ -92,6 +92,7 @@ _ha_const.CONF_HOST = "host"
 _ha_const.CONF_PORT = "port"
 _ha_const.CONF_PASSWORD = "password"
 _ha_exc.ConfigEntryNotReady = _ConfigEntryNotReady
+_ha_exc.HomeAssistantError = type("HomeAssistantError", (Exception,), {})
 _ha_http.StaticPathConfig = lambda *a, **kw: None
 _ha_panel.async_register_panel = lambda *a, **k: None
 _ha_frontend.add_extra_js_url = lambda *a: None
@@ -138,6 +139,18 @@ def run_async(coro):
     return asyncio.get_event_loop().run_until_complete(coro)
 
 
+def _reply(*blocks: tuple[int, bytes]) -> bytes:
+    """A panel reply packet with a valid CRC, one block per (cmd, payload)."""
+    import struct
+    from custom_components.orisec.protocol import calc_crc16
+
+    body = b"".join(
+        struct.pack("<HHHH", cmd, 1, len(data), len(data)) + data for cmd, data in blocks
+    )
+    buf = struct.pack("<H", len(body) + 4) + body
+    return buf + struct.pack("<H", calc_crc16(buf, len(buf)))
+
+
 class TestSendReceiveRetry(unittest.TestCase):
 
     def test_retries_on_timeout(self):
@@ -179,7 +192,7 @@ class TestSendReceiveRetry(unittest.TestCase):
             def fake_sendto(data):
                 nonlocal send_count
                 send_count += 1
-                proto.responses.append(b"\x04\x00\x00\x00")
+                proto.responses.append(_reply((1, b"")))
                 proto.event.set()
 
             mock_transport.sendto = fake_sendto
@@ -207,7 +220,7 @@ class TestSendReceiveRetry(unittest.TestCase):
                 nonlocal call_count
                 call_count += 1
                 if call_count >= 2:
-                    proto.responses.append(b"\x04\x00\x00\x00")
+                    proto.responses.append(_reply((1, b"")))
                     proto.event.set()
 
             mock_transport.sendto = fake_sendto
@@ -513,6 +526,7 @@ class TestSocketReuse(unittest.TestCase):
             coord._conn._transport = MagicMock()
             coord._conn._transport.is_closing.return_value = False
             coord._conn.multi_query = AsyncMock(side_effect=ConnectionError("boom"))
+            coord._last_poll_ok -= 3600
             coord._conn.connect = AsyncMock()
             coord._do_login = AsyncMock()
             coord._do_config = AsyncMock()
@@ -734,7 +748,7 @@ class TestPollRejectsMissingStatus(unittest.TestCase):
 
         run_async(_test())
 
-    def test_unanswered_poll_keeps_last_state_and_reconnects(self):
+    def test_unanswered_poll_within_grace_keeps_entities_available(self):
         async def _test():
             from custom_components.orisec.const import SOS_ARMED
 
@@ -742,10 +756,42 @@ class TestPollRejectsMissingStatus(unittest.TestCase):
             coord.sys_output_state[SOS_ARMED] = 0x01
             coord._conn.multi_query = AsyncMock(side_effect=PanelNoResponseError("silent"))
 
+            data = await coord._async_update_data()
+            data = await coord._async_update_data()
+            self.assertEqual(data["sys_output_state"][SOS_ARMED], 0x01)
+            self.assertEqual(coord._stage, 3)
+            self.assertEqual(coord.connection_stats["consecutive_failures"], 2)
+            coord._start_reconnect.assert_not_called()
+
+        run_async(_test())
+
+    def test_unanswered_polls_past_grace_keep_last_state_and_reconnect(self):
+        async def _test():
+            from custom_components.orisec.const import POLL_FAILURE_GRACE, SOS_ARMED
+
+            coord = _connected_coordinator()
+            coord.sys_output_state[SOS_ARMED] = 0x01
+            coord._last_poll_ok -= POLL_FAILURE_GRACE
+            coord._conn.multi_query = AsyncMock(side_effect=PanelNoResponseError("silent"))
+
             with self.assertRaises(_UpdateFailed):
                 await coord._async_update_data()
             self.assertEqual(coord.sys_output_state[SOS_ARMED], 0x01)
+            self.assertEqual(coord._stage, 0)
+            self.assertEqual(coord.connection_stats["connection_drops"], 1)
             coord._start_reconnect.assert_called_once()
+
+        run_async(_test())
+
+    def test_good_poll_resets_failure_count(self):
+        async def _test():
+            coord = _connected_coordinator()
+            coord._conn.multi_query = AsyncMock(side_effect=PanelNoResponseError("silent"))
+            await coord._async_update_data()
+
+            coord._conn.multi_query = AsyncMock(return_value=_status_response(0x00))
+            await coord._async_update_data()
+            self.assertEqual(coord.connection_stats["consecutive_failures"], 0)
 
         run_async(_test())
 
@@ -905,6 +951,154 @@ class TestMetadataCache(unittest.TestCase):
             _FakeStore.saved["orisec.gone"] = {"max_zones": 20}
             await async_remove_entry(self._hass(), self._entry("gone"))
             self.assertNotIn("orisec.gone", _FakeStore.saved)
+
+        run_async(_test())
+
+
+def _bare_connection(timeout: float = 1.0) -> tuple[OrisecConnection, OrisecUDPProtocol]:
+    conn = OrisecConnection("127.0.0.1", 44444, timeout=timeout)
+    proto = OrisecUDPProtocol()
+    conn._protocol = proto
+    conn._transport = MagicMock()
+    conn._transport.is_closing.return_value = False
+    return conn, proto
+
+
+class TestReplyMatching(unittest.TestCase):
+
+    def test_late_reply_to_earlier_request_is_ignored(self):
+        async def _test():
+            from custom_components.orisec.const import (
+                QUERY_SYS_OUTPUT_STATE, QUERY_ZONE_TEXTS, SOS_ARMED,
+            )
+
+            conn, proto = _bare_connection()
+            loop = asyncio.get_event_loop()
+            status = bytearray(65)
+            status[SOS_ARMED] = 0x01
+
+            def fake_sendto(data):
+                # A zone-name reply from an earlier, timed-out request turns up first.
+                proto.datagram_received(_reply((QUERY_ZONE_TEXTS, b"Hall\x00")), None)
+                loop.call_later(0.02, proto.datagram_received,
+                                _reply((QUERY_SYS_OUTPUT_STATE, bytes(status))), None)
+
+            conn._transport.sendto = fake_sendto
+            result = await conn.multi_query([(QUERY_SYS_OUTPUT_STATE, 1, 65)])
+
+            self.assertEqual(result.zone_names, [])
+            self.assertEqual(result.sys_output_state[SOS_ARMED], 0x01)
+            self.assertEqual(conn.stats["stale_replies_dropped"], 1)
+
+        run_async(_test())
+
+    def test_returns_as_soon_as_every_requested_block_arrives(self):
+        async def _test():
+            conn, proto = _bare_connection(timeout=5.0)
+
+            def fake_sendto(data):
+                proto.datagram_received(_reply((10, b"\x01")), None)
+                proto.datagram_received(_reply((20, b"\x02")), None)
+
+            conn._transport.sendto = fake_sendto
+            from custom_components.orisec.protocol import add_udl_pkt, load_udl_pkt
+
+            loop = asyncio.get_event_loop()
+            started = loop.time()
+            replies = await conn.send_receive(
+                add_udl_pkt(load_udl_pkt(10, 1, 1), 20, 1, 1), settle_time=5.0
+            )
+            self.assertEqual(len(replies), 2)
+            self.assertLess(loop.time() - started, 1.0)
+
+        run_async(_test())
+
+    def test_waits_settle_time_for_a_split_reply(self):
+        async def _test():
+            conn, proto = _bare_connection()
+            loop = asyncio.get_event_loop()
+
+            def fake_sendto(data):
+                proto.datagram_received(_reply((10, b"\x01")), None)
+                loop.call_later(0.05, proto.datagram_received, _reply((20, b"\x02")), None)
+
+            conn._transport.sendto = fake_sendto
+            from custom_components.orisec.protocol import add_udl_pkt, load_udl_pkt
+
+            replies = await conn.send_receive(
+                add_udl_pkt(load_udl_pkt(10, 1, 1), 20, 1, 1), settle_time=0.5
+            )
+            self.assertEqual(len(replies), 2)
+
+        run_async(_test())
+
+    def test_corrupt_reply_is_dropped_once_panel_crc_is_known_good(self):
+        async def _test():
+            conn, proto = _bare_connection(timeout=0.05)
+            good = _reply((1, b""))
+            corrupt = good[:-1] + bytes([good[-1] ^ 0xFF])
+            replies = iter([good, corrupt])
+            conn._transport.sendto = lambda data: proto.datagram_received(next(replies), None)
+
+            from custom_components.orisec.protocol import load_udl_pkt
+            await conn.send_receive(load_udl_pkt(1, 1, 1), settle_time=0.01, retries=1)
+            with self.assertRaises(PanelNoResponseError):
+                await conn.send_receive(load_udl_pkt(1, 1, 1), settle_time=0.01, retries=1)
+            self.assertEqual(conn.stats["corrupt_replies_dropped"], 1)
+
+        run_async(_test())
+
+    def test_crc_is_not_enforced_before_a_valid_one_is_seen(self):
+        async def _test():
+            conn, proto = _bare_connection()
+            good = _reply((1, b""))
+            corrupt = good[:-1] + bytes([good[-1] ^ 0xFF])
+            conn._transport.sendto = lambda data: proto.datagram_received(corrupt, None)
+
+            from custom_components.orisec.protocol import load_udl_pkt
+            replies = await conn.send_receive(load_udl_pkt(1, 1, 1), settle_time=0.01)
+            self.assertEqual(replies, [corrupt])
+
+        run_async(_test())
+
+
+class TestCommandsSentOnce(unittest.TestCase):
+
+    def test_unacknowledged_keypress_is_not_resent(self):
+        async def _test():
+            conn, proto = _bare_connection(timeout=0.05)
+            conn._transport.sendto = MagicMock()
+
+            with self.assertRaises(PanelNoResponseError):
+                await conn.send_keypress(0, 0x01)
+            self.assertEqual(conn._transport.sendto.call_count, 1)
+
+        run_async(_test())
+
+    def test_keypad_char_accepts_any_well_formed_ack(self):
+        async def _test():
+            conn, proto = _bare_connection()
+            conn._transport.sendto = MagicMock(
+                side_effect=lambda data: proto.datagram_received(_reply((9, b"")), None)
+            )
+
+            await conn.send_keypad_char("1")
+            self.assertEqual(conn._transport.sendto.call_count, 1)
+
+        run_async(_test())
+
+    def test_unacknowledged_arm_asks_user_to_check_state(self):
+        async def _test():
+            from homeassistant.exceptions import HomeAssistantError
+
+            coord = _connected_coordinator()
+            coord.async_request_refresh = AsyncMock()
+            coord._conn.send_keypress = AsyncMock(side_effect=PanelNoResponseError("silent"))
+
+            with self.assertRaises(HomeAssistantError):
+                await coord.async_arm_away(0x01)
+            coord._conn.send_keypress.assert_awaited_once()
+            coord.async_request_refresh.assert_awaited_once()
 
         run_async(_test())
 

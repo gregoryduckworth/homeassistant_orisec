@@ -167,6 +167,29 @@ def trim_packet(buf: bytearray) -> bytes:
     return bytes(buf[:total_len])
 
 
+def packet_commands(data: bytes) -> list[int]:
+    """Command IDs of the blocks in a request or reply packet (both share the block layout)."""
+    if len(data) < 4:
+        return []
+    end = min(struct.unpack_from("<H", data, 0)[0] - 2, len(data))
+    pos = 2
+    cmds: list[int] = []
+    while pos + 8 <= end:
+        cmds.append(struct.unpack_from("<H", data, pos)[0])
+        pos += 8 + struct.unpack_from("<H", data, pos + 6)[0]
+    return cmds
+
+
+def crc_valid(data: bytes) -> bool:
+    if len(data) < 4:
+        return False
+    total_len = struct.unpack_from("<H", data, 0)[0]
+    if total_len < 4 or total_len > len(data):
+        return False
+    stored = struct.unpack_from("<H", data, total_len - 2)[0]
+    return stored == calc_crc16(data, total_len - 2)
+
+
 @dataclass
 class ParsedResponse:
     logged_in: bool = False
@@ -455,6 +478,15 @@ class OrisecConnection:
         self._protocol: OrisecUDPProtocol | None = None
         # Replies carry no request id, so only one request may be in flight at a time.
         self._lock = asyncio.Lock()
+        # Only enforce reply CRCs once the panel has been seen to send valid ones.
+        self._crc_trusted = False
+        self.stats: dict[str, int] = {
+            "timeouts": 0,
+            "retries": 0,
+            "refused": 0,
+            "stale_replies_dropped": 0,
+            "corrupt_replies_dropped": 0,
+        }
 
     async def connect(self) -> None:
         if self.connected:
@@ -494,40 +526,46 @@ class OrisecConnection:
         return self._transport is not None and not self._transport.is_closing()
 
     async def send_receive(
-        self, packet: bytearray | bytes, settle_time: float = 0.2
+        self,
+        packet: bytearray | bytes,
+        settle_time: float = 0.2,
+        retries: int = SEND_RETRIES,
+        match_commands: bool = True,
     ) -> list[bytes]:
         async with self._lock:
-            return await self._send_receive(packet, settle_time)
+            return await self._send_receive(
+                packet, settle_time, retries, match_commands
+            )
 
     async def _send_receive(
-        self, packet: bytearray | bytes, settle_time: float
+        self,
+        packet: bytearray | bytes,
+        settle_time: float,
+        retries: int,
+        match_commands: bool,
     ) -> list[bytes]:
         if self._transport is None or self._protocol is None:
             raise ConnectionError("Not connected")
 
-        data = trim_packet(bytearray(packet)) if isinstance(packet, bytes) else trim_packet(packet)
+        data = trim_packet(bytearray(packet))
+        # None accepts any well-formed reply, for requests whose reply format is unknown.
+        expected = set(packet_commands(data)) if match_commands else None
 
         last_error: Exception | None = None
-        for attempt in range(1, SEND_RETRIES + 1):
+        for attempt in range(1, retries + 1):
+            if attempt > 1:
+                self.stats["retries"] += 1
             self._protocol.responses.clear()
             self._protocol.event.clear()
             self._protocol.error = None
 
             self._transport.sendto(data)
-
-            try:
-                await asyncio.wait_for(self._protocol.event.wait(), self.timeout)
-                await asyncio.sleep(settle_time)
-            except asyncio.TimeoutError:
-                _LOGGER.debug(
-                    "UDP timeout (attempt %d/%d)", attempt, SEND_RETRIES
-                )
-                last_error = asyncio.TimeoutError()
-                if attempt < SEND_RETRIES:
-                    await asyncio.sleep(0.3 * attempt)
-                continue
+            replies = await self._collect_replies(expected, settle_time)
+            if replies:
+                return replies
 
             if isinstance(self._protocol.error, ConnectionRefusedError):
+                self.stats["refused"] += 1
                 raise PanelRefusedError(
                     f"Panel at {self.host}:{self.port} refused the connection "
                     "(nothing listening on that port)"
@@ -537,24 +575,83 @@ class OrisecConnection:
                 last_error = ConnectionError(f"UDP error: {self._protocol.error}")
                 _LOGGER.debug(
                     "UDP error (attempt %d/%d): %s",
-                    attempt, SEND_RETRIES, self._protocol.error,
+                    attempt, retries, self._protocol.error,
                 )
-                if attempt < SEND_RETRIES:
-                    await asyncio.sleep(0.3 * attempt)
-                continue
-
-            return self._protocol.responses[:]
+            else:
+                self.stats["timeouts"] += 1
+                last_error = asyncio.TimeoutError()
+                _LOGGER.debug("UDP timeout (attempt %d/%d)", attempt, retries)
+            if attempt < retries:
+                await asyncio.sleep(0.3 * attempt)
 
         _LOGGER.warning(
             "UDP send_receive failed after %d attempts to %s:%s",
-            SEND_RETRIES, self.host, self.port,
+            retries, self.host, self.port,
         )
         if isinstance(last_error, ConnectionError):
             raise last_error
         raise PanelNoResponseError(
             f"No response from panel at {self.host}:{self.port} "
-            f"after {SEND_RETRIES} attempts"
+            f"after {retries} attempts"
         )
+
+    async def _collect_replies(
+        self, expected: set[int] | None, settle_time: float
+    ) -> list[bytes]:
+        """Gather replies to the request just sent, until every block is in or time runs out.
+
+        Once the first reply arrives, stragglers get at most ``settle_time`` to follow.
+        """
+        assert self._protocol is not None
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self.timeout
+        replies: list[bytes] = []
+        seen: set[int] = set()
+        while True:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                break
+            try:
+                await asyncio.wait_for(self._protocol.event.wait(), remaining)
+            except asyncio.TimeoutError:
+                break
+            self._protocol.event.clear()
+            if self._protocol.error is not None:
+                break
+            pending = self._protocol.responses[:]
+            self._protocol.responses.clear()
+            for datagram in pending:
+                cmds = self._accept_reply(datagram, expected)
+                if cmds is None:
+                    continue
+                if not replies:
+                    deadline = min(deadline, loop.time() + settle_time)
+                replies.append(datagram)
+                seen |= cmds
+            if replies and (expected is None or expected <= seen or CMD_ERROR in seen):
+                break
+        return replies
+
+    def _accept_reply(
+        self, datagram: bytes, expected: set[int] | None
+    ) -> set[int] | None:
+        """Return the reply's command IDs, or None if it is corrupt or answers another request."""
+        if crc_valid(datagram):
+            self._crc_trusted = True
+        elif self._crc_trusted:
+            self.stats["corrupt_replies_dropped"] += 1
+            _LOGGER.debug("Dropping corrupt reply (bad length or CRC): %s", datagram.hex())
+            return None
+        cmds = set(packet_commands(datagram))
+        if expected is not None and not cmds & (expected | {CMD_ERROR}):
+            # Replies carry no request id; a late answer to an earlier request lands here.
+            self.stats["stale_replies_dropped"] += 1
+            _LOGGER.debug(
+                "Dropping reply for another request (commands %s, expected %s)",
+                sorted(cmds), sorted(expected),
+            )
+            return None
+        return cmds
 
     async def login(self, password: str) -> ParsedResponse:
         pkt = build_login_packet(password)
@@ -580,24 +677,28 @@ class OrisecConnection:
 
     async def send_keypress(self, key_code: int, area_mask: int) -> ParsedResponse:
         pkt = build_keypress_packet(key_code, area_mask)
-        responses = await self.send_receive(pkt)
+        # Commands aren't idempotent: a lost ack must not make us press the key twice.
+        responses = await self.send_receive(pkt, retries=1)
         return parse_responses(responses)
 
     async def toggle_output(
         self, output_index: int, current_state: int
     ) -> ParsedResponse:
         pkt = build_output_toggle_packet(output_index, current_state)
-        responses = await self.send_receive(pkt)
+        # Commands aren't idempotent: a lost ack must not make us press the key twice.
+        responses = await self.send_receive(pkt, retries=1)
         return parse_responses(responses)
 
     async def send_data(
         self, cmd: int, start: int, count: int, data: bytes
     ) -> ParsedResponse:
         pkt = load_data_pkt(cmd, start, count, data)
-        responses = await self.send_receive(pkt)
+        # Commands aren't idempotent: a lost ack must not make us press the key twice.
+        responses = await self.send_receive(pkt, retries=1)
         return parse_responses(responses)
 
     async def send_keypad_char(self, char: str) -> ParsedResponse:
         pkt = build_keypad_char_packet(char)
-        responses = await self.send_receive(pkt)
+        # Sent once like other commands; the ack's command ID isn't documented, so take any reply.
+        responses = await self.send_receive(pkt, retries=1, match_commands=False)
         return parse_responses(responses)

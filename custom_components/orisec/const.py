@@ -9,6 +9,8 @@ KEYPAD_POLL_INTERVAL = 2
 UDP_TIMEOUT = 3.0
 MAX_LOGIN_RETRIES = 3
 SEND_RETRIES = 3
+# Seconds of unanswered polls tolerated (entities keep last state) before going offline.
+POLL_FAILURE_GRACE = 30.0
 SETUP_CONNECT_TIMEOUT = 10.0
 SETUP_MAX_RETRIES = 3
 SETUP_BACKOFF_BASE = 2.0

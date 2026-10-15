@@ -124,9 +124,13 @@ Stage 3: Initial data load (zone names, types, areas, outputs, part arm texts)
 Stage 4: Polling (continuous 2-second interval)
 ```
 
-On communication failure (no reply after retries, or a reply missing the system output state block) the coordinator keeps the last known state, marks entities unavailable, and starts a background reconnect loop with backoff. Reconnects only re-run stages 1, 2 and a status read; zone/area names are not re-downloaded once loaded.
+A poll the panel doesn't answer (after retries) is tolerated for `POLL_FAILURE_GRACE` (30 s since the last good poll): entities stay available on the last known state. Past that, or immediately if the panel refuses the connection or answers with an error instead of the system output state block (e.g. an expired login), the coordinator keeps the last known state, marks entities unavailable, and starts a background reconnect loop with backoff. Reconnects only re-run stages 1, 2 and a status read; zone/area names are not re-downloaded once loaded.
 
-Requests share one UDP socket and replies carry no request id, so `OrisecConnection` serialises requests with a lock.
+Requests share one UDP socket and replies carry no request id, so `OrisecConnection` serialises requests with a lock and matches replies by command ID: a datagram containing none of the requested command blocks (or `CMD 99`) is a late reply to an earlier request and is dropped. Once the panel has sent one reply with a valid CRC, replies with a bad length or CRC are dropped too. Collection ends as soon as every requested block has arrived, or `settle_time` after the first reply.
+
+Commands that change panel state (keypress, output toggle, keypad characters) are sent once, never retried, because a lost acknowledgement would otherwise press the key twice. An unacknowledged arm/disarm/output command raises `HomeAssistantError` and triggers a state refresh.
+
+Link-quality counters (`timeouts`, `retries`, `refused`, `stale_replies_dropped`, `corrupt_replies_dropped`, `connection_drops`, `consecutive_failures`, `last_error`) are exposed as attributes on the Panel Info sensor.
 
 The panel configuration (stage 3 metadata) is cached in HA storage (`.storage/orisec.<entry_id>`). When a cache exists, setup builds entities from it without contacting the panel and connects in the background; the first successful connection refreshes the cache. Only the first setup (no cache) blocks on the panel and raises `ConfigEntryNotReady` if it is unreachable.
 
@@ -157,7 +161,7 @@ Error handling:
 
 - **Transport:** UDP, connectionless
 - **Timeout:** 3 seconds per request
-- **Settle time:** 200ms after first response to collect additional datagrams
+- **Settle time:** up to 200ms after the first response for any remaining requested blocks
 - **Poll interval:** 2 seconds
 - **No encryption** needed for local LAN communication
 - **No push notifications** — status changes are detected by polling

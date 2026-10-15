@@ -5,17 +5,20 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+import time
 from collections.abc import Callable
 from datetime import datetime, timedelta
 from typing import Any
 
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .const import (
     CONFIG_FLOW_GRACE_PERIOD,
     DOMAIN,
     KEYPAD_POLL_INTERVAL,
+    POLL_FAILURE_GRACE,
     POLL_INTERVAL,
     RECONNECT_BACKOFF_BASE,
     RECONNECT_BACKOFF_MAX,
@@ -74,6 +77,7 @@ from .const import (
 )
 from .protocol import (
     OrisecConnection,
+    PanelNoResponseError,
     PanelRefusedError,
     ParsedResponse,
     add_udl_pkt,
@@ -92,6 +96,10 @@ _METADATA_FIELDS = (
     "zone_names", "area_names", "rem_output_names", "part_arm_names",
 )
 _METADATA_BYTES_FIELDS = ("zone_types", "zone_areas")
+
+
+class PanelSessionError(UpdateFailed):
+    """The panel answered with an error instead of status, e.g. because the login expired."""
 
 
 class OrisecCoordinator(DataUpdateCoordinator[dict[str, Any]]):
@@ -154,6 +162,10 @@ class OrisecCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._reconnect_task: asyncio.Task | None = None
         self._reconnect_attempts: int = 0
         self._last_error_refused: bool = False
+        self._last_poll_ok: float = time.monotonic()
+        self._consecutive_failures: int = 0
+        self._connection_drops: int = 0
+        self._last_error: str | None = None
 
         # False until names/types are read from the panel in this run (a cache restore doesn't count).
         self._metadata_fresh: bool = False
@@ -209,6 +221,7 @@ class OrisecCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             if self.on_metadata_updated is not None:
                 self.on_metadata_updated()
         self._stage = 3
+        self._poll_succeeded()
 
     async def _do_login(self) -> None:
         result = await self._conn.login(self._password)
@@ -319,6 +332,10 @@ class OrisecCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     def _apply_status(self, result: ParsedResponse) -> None:
         # A reply without the status block (e.g. an expired login) must not read as all-zero state.
         if not result.has_command(QUERY_SYS_OUTPUT_STATE):
+            if result.error is not None:
+                raise PanelSessionError(
+                    f"Panel answered with error {result.error} instead of status data"
+                )
             raise UpdateFailed(
                 f"Panel replied without status data (error={result.error})"
             )
@@ -442,6 +459,7 @@ class OrisecCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             result = await self._conn.multi_query(queries)
             self._apply_status(result)
 
+            self._poll_succeeded()
             self._reconnect_attempts = 0
             if result.zone_timers:
                 self.zone_timers = result.zone_timers
@@ -462,12 +480,40 @@ class OrisecCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             return self._build_data_dict()
 
         except Exception as err:
+            self._consecutive_failures += 1
+            self._last_error = str(err) or type(err).__name__
+            # A refusal or an error reply means the session is gone; anything else
+            # (lost datagrams) is ridden out on the last known state for a while.
+            session_lost = isinstance(err, (PanelRefusedError, PanelSessionError))
+            silent_for = time.monotonic() - self._last_poll_ok
+            if not session_lost and silent_for < POLL_FAILURE_GRACE:
+                _LOGGER.debug(
+                    "Poll failed (%d in a row, %.0fs since last good poll), "
+                    "keeping last state: %s",
+                    self._consecutive_failures, silent_for, err,
+                )
+                return self._build_data_dict()
             self._stage = 0
+            self._connection_drops += 1
             self._last_error_refused = isinstance(err, PanelRefusedError)
             self._start_reconnect()
             if isinstance(err, UpdateFailed):
                 raise
             raise UpdateFailed(f"Communication error: {err}") from err
+
+    def _poll_succeeded(self) -> None:
+        self._last_poll_ok = time.monotonic()
+        self._consecutive_failures = 0
+
+    @property
+    def connection_stats(self) -> dict[str, Any]:
+        """Counters for diagnosing an unreliable link (kept to rarely-changing values)."""
+        return {
+            **self._conn.stats,
+            "connection_drops": self._connection_drops,
+            "consecutive_failures": self._consecutive_failures,
+            "last_error": self._last_error,
+        }
 
     @callback
     def _check_alarm_events(self) -> None:
@@ -530,7 +576,15 @@ class OrisecCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     async def async_send_keypress(self, key_code: int, area_mask: int) -> None:
         if not self._conn.connected:
             raise ConnectionError("Not connected to panel")
-        await self._conn.send_keypress(key_code, area_mask)
+        try:
+            await self._conn.send_keypress(key_code, area_mask)
+        except PanelNoResponseError as err:
+            # Sent once only: the ack may be what got lost, so re-read rather than resend.
+            await self.async_request_refresh()
+            raise HomeAssistantError(
+                "The alarm panel did not acknowledge the command. It may still have "
+                "been applied; check the alarm state before trying again."
+            ) from err
         await asyncio.sleep(0.5)
         await self.async_request_refresh()
 
@@ -550,7 +604,14 @@ class OrisecCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         current = 0
         if output_index < len(self.rem_output_state):
             current = self.rem_output_state[output_index]
-        await self._conn.toggle_output(output_index, current)
+        try:
+            await self._conn.toggle_output(output_index, current)
+        except PanelNoResponseError as err:
+            await self.async_request_refresh()
+            raise HomeAssistantError(
+                "The alarm panel did not acknowledge the output change. It may still "
+                "have been applied; check the output state before trying again."
+            ) from err
         await asyncio.sleep(0.3)
         r = await self._conn.query(
             QUERY_REM_OUTPUT_STATE, 1, self.max_rem_outputs + 1

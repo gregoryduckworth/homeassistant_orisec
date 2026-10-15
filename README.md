@@ -13,10 +13,11 @@ Communicates directly with the panel over UDP on port 20202 — no cloud, no int
 - **System sensors** — AC power, battery fault, tamper, bell active, and trouble indicators
 - **Tamper detection** — Per-zone tamper sensors (disabled by default to reduce clutter)
 - **Remote outputs** — Switch entities for all remote outputs (disabled by default)
-- **Panel diagnostics** — Sensor with panel type, version, serial, and connection state
+- **Panel diagnostics** — Sensor with panel type, version, serial, connection state, and link-quality counters (timeouts, retries, dropped replies, connection drops)
 - **Alarm events** — Fires `orisec_alarm_triggered` / `orisec_alarm_cleared` / `orisec_state_changed` on the HA event bus
 - **Polling** — 5-second update interval via lightweight UDP packets (2 seconds while the keypad card is open)
-- **Auto-reconnect** — If communication fails, the integration logs back in automatically in the background; a poll the panel doesn't answer is treated as a failure, never as "disarmed"
+- **Auto-reconnect** — Brief packet loss is ridden out on the last known state for up to 30 seconds; after that, or as soon as the panel rejects the session, entities go unavailable and the integration logs back in automatically in the background. A poll the panel doesn't answer is never treated as "disarmed"
+- **Safe commands** — Arm, disarm, output and keypad commands are sent exactly once; if the panel doesn't acknowledge, HA reports it rather than pressing the key again
 - **Survives restarts** — The panel's zone/area configuration is cached, so after an HA restart entities are created immediately and come online as soon as the panel answers
 - **Custom Lovelace cards** — `orisec-alarm-panel-card` and `orisec-keypad-card` auto-registered; shows your panel's arm-mode names
 - **Sidebar panel** — Auto-registered "Orisec" sidebar item with alarm controls and keypad in one page
@@ -314,7 +315,9 @@ All communication is local UDP. See [docs/PROTOCOL.md](docs/PROTOCOL.md) for ful
 |---------|----------|
 | "Cannot connect" at startup | Integration retries automatically. Check panel IP is reachable (`ping`) and port 20202 is not firewalled. Only the very first setup needs the panel; after that HA starts from the cached configuration. |
 | "Invalid password" | Use the same PIN as your ControlPlus2 mobile app. |
-| Entities show unavailable | Panel may have rebooted. The integration auto-reconnects in the background with backoff. |
+| Entities show unavailable | The panel hasn't answered for 30 seconds, or rejected the session (e.g. it rebooted). The integration auto-reconnects in the background with backoff. |
+| Connection seems flaky | Check the attributes on the **Panel Info** sensor: rising `timeouts`/`retries` point to packet loss on the network, `stale_replies_dropped` to slow replies, `corrupt_replies_dropped` to damaged packets, and `refused` to another client (e.g. the app in local mode) holding the panel's single session. Enable debug logging for `custom_components.orisec` for detail. |
+| "The alarm panel did not acknowledge the command" | The command was sent once but no reply came back, so it may or may not have been applied. Check the alarm state before trying again. |
 | New zones/outputs not appearing | Entities are built from the cached configuration at startup. The cache refreshes once the panel connects; reload the integration to pick up added zones or outputs. |
 | "Refused the connection (nothing listening on that port)" | The panel's IP module only talks to one client at a time and is still holding an old session. The integration always connects from the same local UDP port (21000–21999, derived from the panel address) to avoid this; if it persists, wait for the session to expire or restart the IP module by unplugging its network cable for 30 seconds. |
 | Zones missing | Only zones with a name and type ≠ "Not Used" create entities. |
