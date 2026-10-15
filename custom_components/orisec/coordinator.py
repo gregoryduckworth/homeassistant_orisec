@@ -349,12 +349,13 @@ class OrisecCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         return data
 
     def restore_metadata(self, data: dict[str, Any]) -> None:
-        for f in _METADATA_FIELDS:
-            if f in data:
-                setattr(self, f, data[f])
-        for f in _METADATA_BYTES_FIELDS:
-            if f in data:
+        for f in (*_METADATA_FIELDS, *_METADATA_BYTES_FIELDS):
+            if f not in data:
+                _LOGGER.debug("Cached metadata missing field %s; will refresh from panel", f)
+            elif f in _METADATA_BYTES_FIELDS:
                 setattr(self, f, bytes(data[f]))
+            else:
+                setattr(self, f, data[f])
 
     @callback
     def async_connect_in_background(self) -> None:
