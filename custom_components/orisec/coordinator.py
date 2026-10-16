@@ -208,8 +208,11 @@ class OrisecCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     await asyncio.sleep(delay)
         raise last_err  # type: ignore[misc]
 
-    async def _connect_and_load(self) -> None:
-        await self._conn.connect()
+    async def _connect_and_load(self, fresh_socket: bool = False) -> None:
+        if fresh_socket:
+            await self._conn.reconnect()
+        else:
+            await self._conn.connect()
         await self._do_login()
         await self._do_config()
         if self._metadata_fresh:
@@ -381,7 +384,9 @@ class OrisecCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             )
             await asyncio.sleep(delay)
             try:
-                await self._connect_and_load()
+                # The session is already known to be lost, so don't trust the old socket:
+                # rebuild it on the same local port, which the panel still recognises.
+                await self._connect_and_load(fresh_socket=True)
                 _LOGGER.info(
                     "Reconnected to %s:%s after %d attempts",
                     self._host, self._port, self._reconnect_attempts,
