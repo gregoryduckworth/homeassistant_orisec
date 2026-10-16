@@ -51,8 +51,12 @@ class _FakeDataUpdateCoordinator:
         self.logger = logger
         self.name = name
         self.update_interval = update_interval
+        self.last_update_success = True
 
     def async_set_updated_data(self, data):
+        pass
+
+    def async_update_listeners(self):
         pass
 
 

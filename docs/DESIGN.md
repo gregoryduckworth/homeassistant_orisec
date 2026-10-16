@@ -43,6 +43,8 @@ custom_components/orisec/
 ├── const.py              # All protocol constants
 ├── coordinator.py        # DataUpdateCoordinator (polling + state)
 ├── protocol.py           # UDP transport, packet I/O, response parsing
+├── throttled_log.py      # Rate-limited logging for per-poll/per-packet messages
+├── diagnostics.py        # Diagnostics download (link state, counters, history)
 ├── alarm_control_panel.py # Per-area alarm entities + part-arm entities
 ├── binary_sensor.py      # Per-zone binary sensors (state + tamper)
 ├── switch.py             # Remote output switches
@@ -74,7 +76,7 @@ One primary entity per area (filtered by user's authorised area bitmask):
 - `arm_home` → Keypress code 1/2/3 (Part Arm 1/2/3)
 - `disarm` → Keypress code 4
 
-**Extra attributes:** ready, trouble, bypass, bell, ac_fault, battery_fault, active_part_arm
+**Extra attributes:** ready, trouble, bypass, bell, ac_fault, battery_fault, active_part_arm, state_confirmed, state_cached_since
 
 ### Binary Sensors
 
@@ -98,7 +100,7 @@ One entity per remote output. State read from `rem_output_state[i]`. Toggle via 
 
 ### Sensors
 
-**Panel Status sensor:** Shows online/offline with attributes for panel type, version, serial, AC power, trouble state, and part-arm mode names.
+**Panel Status sensor:** Shows online/offline with attributes for panel type, version, serial, AC power, trouble state, part-arm mode names and the link diagnostics. Unlike other entities it is always available, so the reason for an outage stays visible.
 
 ## Coordinator
 
@@ -134,7 +136,34 @@ The panel answers any number of client endpoints, but sends each reply to whiche
 
 The local port is derived from the panel address (`local_port_for`, 21000–21999) and kept across reconnects and restarts. If it can't be bound, `connect()` raises `LocalPortInUseError` instead of falling back to a random port: the port is only held by another client of the same panel on the same host, which would compete for replies. The error is retried like any other connection failure, logged as a warning, and shown as `port_in_use` in the config flow (an ICMP refusal shows as `panel_refused`). State-changing commands require a logged-in session (`coordinator.connected`), not merely an open socket.
 
-Link-quality counters (`local_port`, `expected_local_port`, `bind_failures`, `timeouts`, `retries`, `refused`, `stale_replies_dropped`, `corrupt_replies_dropped`, `reconnect_attempts`, `connection_drops`, `consecutive_failures`, `last_error`) are exposed as attributes on the Panel Info sensor.
+### Diagnostics
+
+`OrisecConnection` keeps two sets of counters:
+
+- `stats`, problem counters that move only when something goes wrong: `bind_failures`, `failed_requests`, `timeouts`, `retries`, `refused`, `udp_errors`, `stale_replies_dropped` and `corrupt_replies_dropped`.
+- `traffic`, totals that rise on every poll: `requests`, `packets_sent` and `replies_received`.
+
+It also tracks `consecutive_timeouts`, the times of the last request and the last accepted reply, the time the last request took to answer, and the socket's real `local_endpoint` (`getsockname` on the connected socket, so it shows the IP the OS routes from) and `remote_endpoint`.
+
+The counters follow these rules:
+
+- An attempt counts as a timeout when no reply is *accepted* in time, even if stale or corrupt datagrams arrived.
+- A datagram that arrives while no request is waiting for it counts as stale when the next attempt starts.
+- A network error other than a refusal counts under `udp_errors`, not `timeouts`.
+
+The coordinator adds:
+
+- a status: `connected`; `degraded` (failed polls ridden out on the last state); `reconnecting`; `disconnected`.
+- `state_confirmed` and `state_cached_since`, from the time the status block was last applied.
+- `session_errors`.
+- the time and reason of the last transition to unavailable and of the last reconnect attempt.
+- a bounded event history (`DIAGNOSTIC_HISTORY_SIZE`).
+
+Reasons are prefixed with a `failure_category()`: `no_response`, `refused`, `udp_error`, `port_in_use`, `session_error`, `login_rejected`, `invalid_reply`, `socket_error`. Each reconnect attempt's reason is the outage for the first attempt, then the previous attempt's failure. After a failed attempt the reconnect loop calls `async_update_listeners()`, because HA doesn't notify entities about repeated failed polls.
+
+The Panel Info sensor's attributes (`connection_stats`) are kept to values that change only when something goes wrong, so a healthy link doesn't write a new state every poll. `diagnostics()`, served by `diagnostics.py`, adds the traffic totals, timestamps, settings and history; the PIN is redacted from the entry data.
+
+Per-poll and per-packet log messages go through `ThrottledLog`, which lets each kind through at most once per `DEBUG_LOG_INTERVAL` (60 s) and reports how many it skipped. Transitions are logged unthrottled. Logs carry command IDs only, never request payloads, which contain the PIN and key presses.
 
 The panel configuration (stage 3 metadata) is cached in HA storage (`.storage/orisec.<entry_id>`). When a cache exists, setup builds entities from it without contacting the panel and connects in the background; the first successful connection refreshes the cache. Only the first setup (no cache) blocks on the panel and raises `ConfigEntryNotReady` if it is unreachable.
 

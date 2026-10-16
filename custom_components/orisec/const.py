@@ -26,6 +26,10 @@ REFUSED_BACKOFF_BASE = 30.0
 REFUSED_BACKOFF_MAX = 600.0
 LOCAL_PORT_BASE = 21000
 LOCAL_PORT_RANGE = 1000
+# Debug messages that would repeat every poll are logged at most this often per kind.
+DEBUG_LOG_INTERVAL = 60.0
+# Connection events (unavailable, reconnect attempts, ...) kept for the diagnostics download.
+DIAGNOSTIC_HISTORY_SIZE = 30
 
 CONF_PANEL_IP = "panel_ip"
 CONF_PANEL_PORT = "panel_port"
