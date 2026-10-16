@@ -16,7 +16,9 @@ The protocol operates over UDP with two transport modes:
 
 This is the preferred mode for home automation integrations. The panel listens for UDP datagrams on port 20202 and responds to the same source address.
 
-**Several clients at once (tested on a CP20).** The panel answers requests from any IP and source port; none are refused. It keeps one destination for replies, though: whichever endpoint sent the most recent datagram. When a second client's request arrives while the panel is still handling the first (about 0.1 s), the first client's reply goes to the second client and the second request is dropped; if both arrive within ~10 ms, both are lost. Clients must therefore treat a missing reply as lost rather than late, and retry quickly. Login is panel-wide: once any client has logged in, status queries from other endpoints are answered without a login of their own, and `CMD 3` (panel state) reports the logged-in user. The cloud relay path is separate.
+**Several clients at once (tested on a CP20).** The panel answers requests from any IP and source port; none are refused. It keeps one destination for replies, though: whichever endpoint sent the most recent datagram. When a second client's request arrives while the panel is still handling the first (about 0.1 s), the first client's reply goes to the second client and the second request is dropped; if both arrive within ~10 ms, both are lost. Clients must therefore treat a missing reply as lost rather than late, and retry quickly. Login is panel-wide: once any client has logged in, status queries from every other endpoint are answered without a login of their own, and `CMD 3` (panel state) reports the logged-in user. With nobody logged in (e.g. after the IP module restarts), every query is answered with `CMD 99` error 4. The cloud relay path is separate.
+
+**Refusal lockout (seen twice on a CP20, cause unconfirmed).** The IP module can stop accepting UDP altogether: every datagram, from every IP and port, gets an ICMP port-unreachable. Once it lasted ~3.5 minutes and cleared by itself (refusals, then silence, then normal replies); once it lasted over 28 minutes and needed the IP module restarted. Both times it began as a client went away (once within a second of a test client closing its sockets), which suggests the module shuts its listener when a reply it sends is answered with port-unreachable. Clients should keep their socket open while replies may still arrive.
 
 ### Cloud Relay
 
@@ -152,6 +154,7 @@ The full 256-entry CRC16 table is provided in `const.py`.
 
 **Error codes:**
 - `3` = Password failed
+- `4` = Not logged in (no client has a session)
 - `5` = Command not supported
 - `65503` = Authorisation key failed (cloud only)
 
