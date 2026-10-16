@@ -445,6 +445,8 @@ class OrisecUDPProtocol(asyncio.DatagramProtocol):
         self.event = asyncio.Event()
         self.transport: asyncio.DatagramTransport | None = None
         self.error: Exception | None = None
+        # Set once the OS socket is really closed and its local port is free again.
+        self.closed = asyncio.Event()
 
     def connection_made(self, transport: asyncio.DatagramTransport) -> None:  # type: ignore[override]
         self.transport = transport
@@ -459,7 +461,7 @@ class OrisecUDPProtocol(asyncio.DatagramProtocol):
         self.event.set()
 
     def connection_lost(self, exc: Exception | None) -> None:
-        pass
+        self.closed.set()
 
 
 def local_port_for(host: str, port: int) -> int:
@@ -491,6 +493,8 @@ class OrisecConnection:
     async def connect(self) -> None:
         if self.connected:
             return
+        # A socket still closing holds the fixed port; binding now would fall back to a random one.
+        await self._wait_closed()
         loop = asyncio.get_running_loop()
         try:
             self._transport, self._protocol = await loop.create_datagram_endpoint(
@@ -518,8 +522,28 @@ class OrisecConnection:
     async def disconnect(self) -> None:
         if self._transport is not None:
             self._transport.close()
+            await self._wait_closed()
             self._transport = None
             self._protocol = None
+
+    async def reconnect(self) -> None:
+        """Replace the socket with a fresh one bound to the same local port.
+
+        The panel sees the same client endpoint, but any state stuck on the old socket
+        (e.g. a source address cached before the host's IP changed) is dropped.
+        """
+        async with self._lock:
+            await self.disconnect()
+            await self.connect()
+
+    async def _wait_closed(self) -> None:
+        # transport.close() only releases the socket on a later loop iteration.
+        if self._transport is None or self._protocol is None:
+            return
+        try:
+            await asyncio.wait_for(self._protocol.closed.wait(), 1.0)
+        except asyncio.TimeoutError:
+            _LOGGER.debug("UDP socket to %s:%s did not report closing", self.host, self.port)
 
     @property
     def connected(self) -> bool:

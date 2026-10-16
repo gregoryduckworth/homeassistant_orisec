@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import sys
 import types
 import unittest
@@ -507,38 +508,44 @@ class TestSocketReuse(unittest.TestCase):
                 await conn.connect()
                 self.assertIsNot(conn._transport, first)
                 self.assertTrue(conn.connected)
+                # Waits for the old socket to let go of the port instead of falling back.
+                self.assertEqual(
+                    conn._transport.get_extra_info("sockname")[1], conn.local_port
+                )
             finally:
                 await conn.disconnect()
 
         run_async(_test())
 
-    def test_reconnect_and_poll_failure_keep_socket(self):
+    def test_reconnect_rebuilds_socket_on_same_local_port(self):
         async def _test():
-            hass = MagicMock()
-            hass.async_create_task = lambda coro, name=None: asyncio.ensure_future(coro)
-            coord = OrisecCoordinator(hass, "127.0.0.1", 44444, "1234")
-            coord.max_zones = 10
-            coord.max_areas = 2
-            coord._stage = 3
+            conn = OrisecConnection("127.0.0.1", 44444)
+            await conn.connect()
+            first = conn._transport
+            try:
+                await conn.reconnect()
+                self.assertIsNot(conn._transport, first)
+                self.assertTrue(first.is_closing())
+                self.assertEqual(
+                    conn._transport.get_extra_info("sockname")[1], conn.local_port
+                )
+            finally:
+                await conn.disconnect()
 
-            disconnect = AsyncMock()
-            coord._conn.disconnect = disconnect
-            coord._conn._transport = MagicMock()
-            coord._conn._transport.is_closing.return_value = False
+        run_async(_test())
+
+    def test_poll_failure_leaves_socket_for_reconnect_to_replace(self):
+        async def _test():
+            coord = _connected_coordinator()
+            transport = coord._conn._transport
             coord._conn.multi_query = AsyncMock(side_effect=ConnectionError("boom"))
             coord._last_poll_ok -= 3600
-            coord._conn.connect = AsyncMock()
-            coord._do_login = AsyncMock()
-            coord._do_config = AsyncMock()
-            coord._do_initial_data = AsyncMock()
 
-            with patch("custom_components.orisec.coordinator.asyncio.sleep", new_callable=AsyncMock):
-                with self.assertRaises(_UpdateFailed):
-                    await coord._async_update_data()
-                await coord._reconnect_task
+            with self.assertRaises(_UpdateFailed):
+                await coord._async_update_data()
 
-            disconnect.assert_not_called()
-            self.assertEqual(coord._stage, 3)
+            transport.close.assert_not_called()
+            coord._start_reconnect.assert_called_once()
 
         run_async(_test())
 
@@ -608,6 +615,101 @@ class TestRefusedBackoff(unittest.TestCase):
             self.assertGreaterEqual(delays[1], 60)
             self.assertEqual(coord._stage, 3)
             self.assertFalse(coord._last_error_refused)
+
+        run_async(_test())
+
+
+class _FakePanel(asyncio.DatagramProtocol):
+    """A panel on localhost that answers every requested block, unless told to drop packets."""
+
+    def __init__(self) -> None:
+        self.transport: asyncio.DatagramTransport | None = None
+        self.client_ports: set[int] = set()
+        self.logins = 0
+        self.drop = 0
+
+    def connection_made(self, transport) -> None:
+        self.transport = transport
+
+    def datagram_received(self, data: bytes, addr) -> None:
+        from custom_components.orisec.const import CMD_PASSWORD, QUERY_SYS_OUTPUT_STATE
+        from custom_components.orisec.protocol import packet_commands
+
+        self.client_ports.add(addr[1])
+        if self.drop > 0:
+            self.drop -= 1
+            return
+        cmds = packet_commands(data)
+        if CMD_PASSWORD in cmds:
+            self.logins += 1
+        blocks = [(c, bytes(65) if c == QUERY_SYS_OUTPUT_STATE else b"") for c in cmds]
+        self.transport.sendto(_reply(*blocks), addr)
+
+
+class TestRecoveryAfterLostPanel(unittest.TestCase):
+    """End to end over real UDP: lose the panel, then check HA recovers without a reload."""
+
+    async def _start(self):
+        loop = asyncio.get_running_loop()
+        transport, panel = await loop.create_datagram_endpoint(
+            _FakePanel, local_addr=("127.0.0.1", 0)
+        )
+        port = transport.get_extra_info("sockname")[1]
+        hass = MagicMock()
+        hass.async_create_task = lambda coro, name=None: asyncio.ensure_future(coro)
+        coord = OrisecCoordinator(hass, "127.0.0.1", port, "1234")
+        coord._conn.timeout = 0.05
+        coord._metadata_fresh = True
+        await coord._connect_and_load()
+        self.assertTrue(coord.connected)
+        return panel, coord
+
+    async def _lose_then_recover(self, coord) -> None:
+        # Past the grace period, the failed poll marks entities unavailable and reconnects.
+        coord._last_poll_ok -= 3600
+        with patch("custom_components.orisec.coordinator.asyncio.sleep", new_callable=AsyncMock):
+            with self.assertRaises(_UpdateFailed):
+                await coord._async_update_data()
+            self.assertFalse(coord.connected)
+            await asyncio.wait_for(coord._reconnect_task, 5)
+        self.assertTrue(coord.connected)
+        await coord._async_update_data()
+
+    def test_recovers_once_panel_answers_again(self):
+        async def _test():
+            panel, coord = await self._start()
+            try:
+                # The failed poll plus two failed reconnect attempts, each with all retries.
+                panel.drop = 3 * SEND_RETRIES
+                await self._lose_then_recover(coord)
+
+                self.assertEqual(panel.drop, 0)
+                self.assertEqual(panel.logins, 2)
+                self.assertEqual(panel.client_ports, {coord._conn.local_port})
+            finally:
+                await coord.async_shutdown()
+                panel.transport.close()
+
+        run_async(_test())
+
+    def test_recovers_when_old_socket_is_stuck_failing(self):
+        async def _test():
+            panel, coord = await self._start()
+            try:
+                # Host-side breakage the panel can't see, e.g. a source address cached on the
+                # socket before HA's IP changed: every send on the old socket fails.
+                stuck = coord._conn._transport
+                stuck_protocol = coord._conn._protocol
+                stuck.sendto = lambda data: stuck_protocol.error_received(
+                    OSError(errno.ENETUNREACH, "Network is unreachable")
+                )
+                await self._lose_then_recover(coord)
+
+                self.assertIsNot(coord._conn._transport, stuck)
+                self.assertEqual(panel.client_ports, {coord._conn.local_port})
+            finally:
+                await coord.async_shutdown()
+                panel.transport.close()
 
         run_async(_test())
 
