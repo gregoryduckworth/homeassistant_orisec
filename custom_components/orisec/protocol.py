@@ -6,6 +6,7 @@ import asyncio
 import errno
 import logging
 import struct
+import time
 import zlib
 from dataclasses import dataclass, field
 from typing import Any
@@ -54,8 +55,10 @@ from .const import (
     SEND_RETRIES,
     UDP_TIMEOUT,
 )
+from .throttled_log import ThrottledLog
 
 _LOGGER = logging.getLogger(__name__)
+_THROTTLED = ThrottledLog(_LOGGER)
 
 
 def calc_crc16(data: bytes | bytearray, count: int) -> int:
@@ -439,6 +442,10 @@ class PanelNoResponseError(ConnectionError):
     """The panel never answered a request, even after retries."""
 
 
+class PanelUDPError(ConnectionError):
+    """The host's network stack reported an error for our datagrams (other than a refusal)."""
+
+
 class LocalPortInUseError(ConnectionError):
     """The fixed local UDP port is held by another socket, so the panel can't be reached from it."""
 
@@ -461,12 +468,16 @@ class OrisecUDPProtocol(asyncio.DatagramProtocol):
         self.event.set()
 
     def error_received(self, exc: Exception) -> None:
-        _LOGGER.debug("UDP error: %s", exc)
+        _THROTTLED.debug("udp_error_received", "UDP error: %s", exc)
         self.error = exc
         self.event.set()
 
     def connection_lost(self, exc: Exception | None) -> None:
         self.closed.set()
+
+
+def _format_endpoint(addr: Any) -> str:
+    return f"{addr[0]}:{addr[1]}"
 
 
 def local_port_for(host: str, port: int) -> int:
@@ -495,14 +506,38 @@ class OrisecConnection:
         self._lock = asyncio.Lock()
         # Only enforce reply CRCs once the panel has been seen to send valid ones.
         self._crc_trusted = False
+        # Problem counters: these only move when something goes wrong.
         self.stats: dict[str, int] = {
             "bind_failures": 0,
+            # Requests that got no usable reply, after all their attempts.
+            "failed_requests": 0,
+            # Attempts that got no usable reply within the timeout (dropped replies don't count).
             "timeouts": 0,
             "retries": 0,
             "refused": 0,
+            # Errors other than a refusal reported by the host for our datagrams.
+            "udp_errors": 0,
+            # Replies that answered no request in flight (late, or for another request).
             "stale_replies_dropped": 0,
             "corrupt_replies_dropped": 0,
         }
+        # Traffic totals: these rise on every poll.
+        self.traffic: dict[str, int] = {
+            # Requests made; a retried request counts once.
+            "requests": 0,
+            # Datagrams sent, including retries.
+            "packets_sent": 0,
+            # Datagrams accepted as replies.
+            "replies_received": 0,
+        }
+        # Attempts in a row without a usable reply; reset by any accepted reply.
+        self.consecutive_timeouts = 0
+        # Wall-clock times (time.time()) for diagnostics.
+        self.last_request_at: float | None = None
+        self.last_reply_at: float | None = None
+        # From sending a request to its first accepted reply.
+        self.last_response_time: float | None = None
+        self.last_udp_error: str | None = None
 
     async def connect(self) -> None:
         if self.connected:
@@ -527,10 +562,7 @@ class OrisecConnection:
                 "is already in use by another socket, e.g. another Home Assistant "
                 "instance or config entry talking to the same panel"
             ) from err
-        _LOGGER.debug(
-            "UDP socket %s -> %s:%s",
-            self._transport.get_extra_info("sockname"), self.host, self.port,
-        )
+        _LOGGER.debug("UDP socket %s -> %s", self.local_endpoint, self.remote_endpoint)
 
     async def disconnect(self) -> None:
         if self._transport is not None:
@@ -569,6 +601,22 @@ class OrisecConnection:
             return None
         return self._transport.get_extra_info("sockname")[1]
 
+    @property
+    def local_endpoint(self) -> str | None:
+        """The open socket's source address as ``ip:port`` (the IP the OS routes from)."""
+        if not self.connected:
+            return None
+        return _format_endpoint(self._transport.get_extra_info("sockname"))
+
+    @property
+    def remote_endpoint(self) -> str:
+        """The panel address the socket sends to."""
+        if self.connected:
+            peer = self._transport.get_extra_info("peername")
+            if peer:
+                return _format_endpoint(peer)
+        return f"{self.host}:{self.port}"
+
     async def send_receive(
         self,
         packet: bytearray | bytes,
@@ -578,10 +626,17 @@ class OrisecConnection:
         timeout: float | None = None,
     ) -> list[bytes]:
         async with self._lock:
-            return await self._send_receive(
-                packet, settle_time, retries, match_commands,
-                self.timeout if timeout is None else timeout,
-            )
+            if self._transport is None or self._protocol is None:
+                raise ConnectionError("Not connected")
+            self.traffic["requests"] += 1
+            try:
+                return await self._send_receive(
+                    packet, settle_time, retries, match_commands,
+                    self.timeout if timeout is None else timeout,
+                )
+            except Exception:
+                self.stats["failed_requests"] += 1
+                raise
 
     async def _send_receive(
         self,
@@ -591,24 +646,39 @@ class OrisecConnection:
         match_commands: bool,
         timeout: float,
     ) -> list[bytes]:
-        if self._transport is None or self._protocol is None:
-            raise ConnectionError("Not connected")
-
+        assert self._transport is not None and self._protocol is not None
         data = trim_packet(bytearray(packet))
         # None accepts any well-formed reply, for requests whose reply format is unknown.
         expected = set(packet_commands(data)) if match_commands else None
 
+        # Only command IDs are ever logged: request payloads carry the PIN and key presses.
+        commands = sorted(packet_commands(data))
         last_error: Exception | None = None
         for attempt in range(1, retries + 1):
             if attempt > 1:
                 self.stats["retries"] += 1
-            self._protocol.responses.clear()
+            self._discard_unclaimed_replies()
             self._protocol.event.clear()
             self._protocol.error = None
 
+            loop = asyncio.get_running_loop()
+            sent_at = loop.time()
+            self.last_request_at = time.time()
+            self.traffic["packets_sent"] += 1
             self._transport.sendto(data)
-            replies = await self._collect_replies(expected, settle_time, timeout)
+            replies, first_reply_at = await self._collect_replies(
+                expected, settle_time, timeout
+            )
             if replies:
+                self.last_response_time = first_reply_at - sent_at
+                _THROTTLED.debug(
+                    "exchange",
+                    "Request %s answered by %d datagram(s) in %.0f ms on attempt %d/%d "
+                    "(%s -> %s; totals: %s; problems: %s)",
+                    commands, len(replies), self.last_response_time * 1000, attempt,
+                    retries, self.local_endpoint, self.remote_endpoint, self.traffic,
+                    {k: v for k, v in self.stats.items() if v},
+                )
                 return replies
 
             if isinstance(self._protocol.error, ConnectionRefusedError):
@@ -620,21 +690,29 @@ class OrisecConnection:
                 )
 
             if self._protocol.error:
-                last_error = ConnectionError(f"UDP error: {self._protocol.error}")
-                _LOGGER.debug(
-                    "UDP error (attempt %d/%d): %s",
-                    attempt, retries, self._protocol.error,
+                self.stats["udp_errors"] += 1
+                self.last_udp_error = str(self._protocol.error)
+                last_error = PanelUDPError(f"UDP error: {self._protocol.error}")
+                _THROTTLED.debug(
+                    "udp_error", "UDP error for request %s (attempt %d/%d): %s",
+                    commands, attempt, retries, self._protocol.error,
                 )
             else:
                 self.stats["timeouts"] += 1
+                self.consecutive_timeouts += 1
                 last_error = asyncio.TimeoutError()
-                _LOGGER.debug("UDP timeout (attempt %d/%d)", attempt, retries)
+                _THROTTLED.debug(
+                    "timeout",
+                    "No reply to request %s within %.1fs (attempt %d/%d, %d in a row)",
+                    commands, timeout, attempt, retries, self.consecutive_timeouts,
+                )
             if attempt < retries:
                 await asyncio.sleep(0.3 * attempt)
 
-        _LOGGER.warning(
-            "UDP send_receive failed after %d attempts to %s:%s",
-            retries, self.host, self.port,
+        _THROTTLED.warning(
+            "request_failed",
+            "No usable reply to request %s from %s after %d attempts (local endpoint %s)",
+            commands, self.remote_endpoint, retries, self.local_endpoint,
         )
         if isinstance(last_error, ConnectionError):
             raise last_error
@@ -645,14 +723,16 @@ class OrisecConnection:
 
     async def _collect_replies(
         self, expected: set[int] | None, settle_time: float, timeout: float
-    ) -> list[bytes]:
+    ) -> tuple[list[bytes], float]:
         """Gather replies to the request just sent, until every block is in or time runs out.
 
         Once the first reply arrives, stragglers get at most ``settle_time`` to follow.
+        Also returns the loop time the first reply was accepted (the deadline if none was).
         """
         assert self._protocol is not None
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
+        first_reply_at = deadline
         replies: list[bytes] = []
         seen: set[int] = set()
         while True:
@@ -673,12 +753,13 @@ class OrisecConnection:
                 if cmds is None:
                     continue
                 if not replies:
-                    deadline = min(deadline, loop.time() + settle_time)
+                    first_reply_at = loop.time()
+                    deadline = min(deadline, first_reply_at + settle_time)
                 replies.append(datagram)
                 seen |= cmds
             if replies and (expected is None or expected <= seen or CMD_ERROR in seen):
                 break
-        return replies
+        return replies, first_reply_at
 
     def _accept_reply(
         self, datagram: bytes, expected: set[int] | None
@@ -688,18 +769,42 @@ class OrisecConnection:
             self._crc_trusted = True
         elif self._crc_trusted:
             self.stats["corrupt_replies_dropped"] += 1
-            _LOGGER.debug("Dropping corrupt reply (bad length or CRC): %s", datagram.hex())
+            # Length and header only: payloads may echo keypad entries.
+            _THROTTLED.debug(
+                "corrupt",
+                "Dropping corrupt reply (bad length or CRC): %d bytes, header %s",
+                len(datagram), datagram[:10].hex(),
+            )
             return None
         cmds = set(packet_commands(datagram))
         if expected is not None and not cmds & (expected | {CMD_ERROR}):
             # Replies carry no request id; a late answer to an earlier request lands here.
             self.stats["stale_replies_dropped"] += 1
-            _LOGGER.debug(
+            _THROTTLED.debug(
+                "stale",
                 "Dropping reply for another request (commands %s, expected %s)",
                 sorted(cmds), sorted(expected),
             )
             return None
+        self.traffic["replies_received"] += 1
+        self.consecutive_timeouts = 0
+        self.last_reply_at = time.time()
         return cmds
+
+    def _discard_unclaimed_replies(self) -> None:
+        """Drop datagrams that arrived while no request was waiting for them, counting them."""
+        assert self._protocol is not None
+        if not self._protocol.responses:
+            return
+        count = len(self._protocol.responses)
+        self.stats["stale_replies_dropped"] += count
+        _THROTTLED.debug(
+            "unclaimed",
+            "Dropping %d reply datagram(s) that arrived after their request gave up "
+            "(commands %s)",
+            count, [packet_commands(d) for d in self._protocol.responses],
+        )
+        self._protocol.responses.clear()
 
     async def login(self, password: str) -> ParsedResponse:
         pkt = build_login_packet(password)

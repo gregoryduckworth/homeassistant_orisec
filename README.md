@@ -13,7 +13,7 @@ Communicates directly with the panel over UDP on port 20202 — no cloud, no int
 - **System sensors** — AC power, battery fault, tamper, bell active, and trouble indicators
 - **Tamper detection** — Per-zone tamper sensors (disabled by default to reduce clutter)
 - **Remote outputs** — Switch entities for all remote outputs (disabled by default)
-- **Panel diagnostics** — Sensor with panel type, version, serial, connection state, and link-quality counters (timeouts, retries, dropped replies, connection drops)
+- **Panel diagnostics** — Sensor with panel type, version, serial, connection state, and link-quality counters (timeouts, retries, dropped replies, connection drops). It stays available while the panel is offline and shows why. A diagnostics download adds traffic totals, timestamps, the UDP endpoints and a history of outages and reconnect attempts (see [Diagnosing unavailability](#diagnosing-unavailability))
 - **Alarm events** — Fires `orisec_alarm_triggered` / `orisec_alarm_cleared` / `orisec_state_changed` on the HA event bus
 - **Polling** — 5-second update interval via lightweight UDP packets (2 seconds while the keypad card is open)
 - **Auto-reconnect** — Brief packet loss is ridden out on the last known state for up to 30 seconds; after that, or as soon as the panel rejects the session, entities go unavailable and the integration logs back in automatically in the background. A poll the panel doesn't answer is never treated as "disarmed"
@@ -131,9 +131,11 @@ Remote outputs (labelled "Remote 1–5" if unnamed) are the panel's relay output
 
 | Entity | Description |
 |--------|-------------|
-| `sensor.panel_info` | Online/offline (DIAGNOSTIC) |
+| `sensor.panel_info` | Online/offline (DIAGNOSTIC). Stays available while the panel is offline, so its attributes can say why |
 
-**Attributes:** `panel_type`, `panel_version`, `serial`, `host`, `max_zones`, `max_areas`, `max_remote_outputs`, `part_arm_mask`, `ac_power`, `trouble`, `engineer_required`, `area_N_state`, `area_N_name`, `part_arm_names`
+**Attributes:** `panel_type`, `panel_version`, `serial`, `host`, `max_zones`, `max_areas`, `max_remote_outputs`, `part_arm_mask`, `ac_power`, `trouble`, `engineer_required`, `area_N_state`, `area_N_name`, `part_arm_names`, plus the connection attributes described in [Diagnosing unavailability](#diagnosing-unavailability)
+
+Alarm entities also carry `state_confirmed` (false while failed polls are being ridden out on the last known state) and `state_cached_since` (when the panel last confirmed the state shown).
 
 ## Custom Lovelace Cards
 
@@ -319,6 +321,61 @@ Home Assistant always connects from the same local UDP port (21000–21999, deri
 
 The **Panel Info** sensor shows `local_port` (the port in use; empty while disconnected), `expected_local_port`, `bind_failures` and `reconnect_attempts`. `timeouts` and `stale_replies_dropped` that keep rising on an otherwise healthy network mean another local client is polling the panel.
 
+## Diagnosing unavailability
+
+There are two places to look:
+
+- **Panel Info sensor attributes.** These are live and stay visible while the panel is offline. To avoid writing a new state every 5 seconds, they hold only values that change when something goes wrong.
+- **Diagnostics download** (**Settings → Devices & Services → Orisec → ⋮ → Download diagnostics**). This adds everything that changes on every poll, plus a history of the last 30 connection events. The PIN is redacted and request contents are never included.
+
+| Field | Where | Meaning |
+|-------|-------|---------|
+| `status` | both | `connected`; `degraded` (polls failing, last known state shown); `reconnecting`; `disconnected` |
+| `state_confirmed` / `state_cached_since` | both | Whether entity state comes from the latest poll, or from the panel's last reply at `state_cached_since` |
+| `local_endpoint` / `remote_endpoint` | both | The UDP source `ip:port` Home Assistant actually sends from, and the panel address |
+| `last_unavailable_at` / `last_unavailable_reason` | both | When and why entities last went unavailable |
+| `last_reconnect_at` / `last_reconnect_reason` | both | When the latest reconnect attempt ran, and why: the outage for the first attempt, the previous attempt's failure for later ones |
+| `timeouts`, `consecutive_timeouts`, `retries`, `failed_requests` | both | Attempts with no usable reply, attempts in a row without one, resends, and requests that failed after all attempts |
+| `stale_replies_dropped`, `corrupt_replies_dropped` | both | Replies rejected because they answered no request in flight, or failed the length/CRC check |
+| `refused`, `udp_errors`, `bind_failures`, `session_errors` | both | ICMP refusals, other network errors on send, local port conflicts, and error replies where status was expected |
+| `timestamps.last_poll_started` | download | The coordinator last asked for data |
+| `timestamps.last_request_sent` | download | A datagram last went out |
+| `timestamps.last_reply_received` | download | A usable reply last came back (last successful communication) |
+| `timestamps.last_confirmed_state` | download | The panel's status was last read and applied (last successful panel response) |
+| `counters.requests`, `packets_sent`, `replies_received`, `polls` | download | Traffic totals since HA started |
+| `last_response_time_ms` | download | How long the panel took to answer the last request |
+| `history` | download | Timeline of `unavailable`, `state_unconfirmed`, `state_confirmed`, `reconnect_failed` and `reconnected` events |
+
+Reasons start with a category that says where the problem is:
+
+| Category | Meaning |
+|----------|---------|
+| `no_response` | Requests went out but no usable reply came back: lost packets, the panel ignoring us, or another local client taking our replies |
+| `refused` | The panel's IP module answered "port unreachable" |
+| `udp_error` | The HA host couldn't send, e.g. no route to the panel |
+| `port_in_use` | Another socket on the HA host holds the integration's UDP port, so nothing was sent |
+| `session_error` | The panel answered with an error instead of status, e.g. its login session was lost |
+| `login_rejected` | The panel refused the PIN |
+| `invalid_reply` | The panel answered without the requested status data |
+| `socket_error` | A socket-level failure on the HA host |
+
+To see which part has stopped, compare the timestamps in a download:
+
+- `last_poll_started` is old: the coordinator has stopped polling.
+- `last_request_sent` is old, but polls are recent: requests aren't being sent (look at `status` and `last_reconnect_reason`).
+- Requests are recent but `last_reply_received` is old: replies are missing.
+- Replies are recent but `last_confirmed_state` is old: replies are being rejected. Look at `stale_replies_dropped`, `corrupt_replies_dropped` and `session_errors`.
+
+### Debug logging
+
+```yaml
+logger:
+  logs:
+    custom_components.orisec: debug
+```
+
+Messages that would repeat on every poll or packet are rate-limited: each kind (successful exchanges, timeouts, stale or corrupt replies, UDP errors, failed polls) is logged at most once a minute, and the next one says how many were skipped. That includes a periodic line showing that requests are being answered, with running totals. Going unavailable, reconnect attempts and reconnections are always logged. Debug logs show command IDs, never request contents, so the PIN and keypad presses are never written.
+
 ## Troubleshooting
 
 | Problem | Solution |
@@ -326,7 +383,7 @@ The **Panel Info** sensor shows `local_port` (the port in use; empty while disco
 | "Cannot connect" at startup | Integration retries automatically. Check panel IP is reachable (`ping`) and port 20202 is not firewalled. Only the very first setup needs the panel; after that HA starts from the cached configuration. |
 | "Invalid password" | Use the same PIN as your ControlPlus2 mobile app. |
 | Entities show unavailable | The panel hasn't answered for 30 seconds, or rejected the session (e.g. it rebooted). The integration auto-reconnects in the background with backoff. If it only happens while the ControlPlus2 app is open in local mode, switch the app to cloud mode or close it when you're not using it. |
-| Connection seems flaky | Check the attributes on the **Panel Info** sensor: rising `timeouts`/`retries` point to packet loss on the network, `stale_replies_dropped` to slow replies, `corrupt_replies_dropped` to damaged packets, `refused` to the panel's network module not listening (e.g. while it restarts), and `bind_failures` to another program holding HA's local UDP port. Timeouts and stale replies that rise only while the ControlPlus2 app is open in local mode come from the app competing for the panel's replies (see [Sharing the panel with the ControlPlus2 app](#sharing-the-panel-with-the-controlplus2-app)). `reconnect_attempts` counts the attempts in the current outage. Enable debug logging for `custom_components.orisec` for detail. |
+| Connection seems flaky | See [Diagnosing unavailability](#diagnosing-unavailability). In short, check the attributes on the **Panel Info** sensor: rising `timeouts`/`retries` point to packet loss on the network, `stale_replies_dropped` to slow replies, `corrupt_replies_dropped` to damaged packets, `refused` to the panel's network module not listening (e.g. while it restarts), and `bind_failures` to another program holding HA's local UDP port. Timeouts and stale replies that rise only while the ControlPlus2 app is open in local mode come from the app competing for the panel's replies (see [Sharing the panel with the ControlPlus2 app](#sharing-the-panel-with-the-controlplus2-app)). `reconnect_attempts` counts the attempts in the current outage, and `last_unavailable_reason` says why entities last went unavailable. Enable debug logging for `custom_components.orisec` for detail. |
 | "The alarm panel did not acknowledge the command" | The command was sent once but no reply came back, so it may or may not have been applied. Check the alarm state before trying again. |
 | New zones/outputs not appearing | Entities are built from the cached configuration at startup. The cache refreshes once the panel connects; reload the integration to pick up added zones or outputs. |
 | "Refused the connection from local port …" / "The panel refused the connection" | The panel's network module answered "port unreachable" and is refusing every client, not just Home Assistant. What triggers it isn't known. It can clear by itself within a few minutes, but has also lasted over half an hour; Home Assistant can't clear it. Restart the IP module by unplugging its network cable for 30 seconds, then reload the integration to reconnect straight away instead of waiting for its back-off. |

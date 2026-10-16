@@ -52,6 +52,11 @@ class OrisecPanelInfoSensor(CoordinatorEntity[OrisecCoordinator], SensorEntity):
         }
 
     @property
+    def available(self) -> bool:
+        # Stays available while the panel is offline, so its attributes can say why.
+        return True
+
+    @property
     def native_value(self) -> str:
         return "online" if self.coordinator.connected else "offline"
 
