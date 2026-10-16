@@ -130,7 +130,11 @@ Requests share one UDP socket and replies carry no request id, so `OrisecConnect
 
 Commands that change panel state (keypress, output toggle, keypad characters) are sent once, never retried, because a lost acknowledgement would otherwise press the key twice. An unacknowledged arm/disarm/output command raises `HomeAssistantError` and triggers a state refresh.
 
-Link-quality counters (`timeouts`, `retries`, `refused`, `stale_replies_dropped`, `corrupt_replies_dropped`, `connection_drops`, `consecutive_failures`, `last_error`) are exposed as attributes on the Panel Info sensor.
+The panel answers any number of client endpoints, but sends each reply to whichever endpoint sent to it last, and holds a single login session shared by all of them (tested on a CP20). When another local client (the ControlPlus2 app in local mode) sends during the ~0.1 s the panel takes to answer, our reply goes to that client and our request is dropped; nothing arrives late. Read attempts therefore wait only `UDP_TIMEOUT` (1 s; the panel answers in 0.1–0.3 s) before retrying, while state-changing commands, which are sent once, wait `COMMAND_TIMEOUT` (3 s) for their ack.
+
+The local port is derived from the panel address (`local_port_for`, 21000–21999) and kept across reconnects and restarts. If it can't be bound, `connect()` raises `LocalPortInUseError` instead of falling back to a random port: the port is only held by another client of the same panel on the same host, which would compete for replies. The error is retried like any other connection failure, logged as a warning, and shown as `port_in_use` in the config flow (an ICMP refusal shows as `panel_refused`). State-changing commands require a logged-in session (`coordinator.connected`), not merely an open socket.
+
+Link-quality counters (`local_port`, `expected_local_port`, `bind_failures`, `timeouts`, `retries`, `refused`, `stale_replies_dropped`, `corrupt_replies_dropped`, `reconnect_attempts`, `connection_drops`, `consecutive_failures`, `last_error`) are exposed as attributes on the Panel Info sensor.
 
 The panel configuration (stage 3 metadata) is cached in HA storage (`.storage/orisec.<entry_id>`). When a cache exists, setup builds entities from it without contacting the panel and connects in the background; the first successful connection refreshes the cache. Only the first setup (no cache) blocks on the panel and raises `ConfigEntryNotReady` if it is unreachable.
 
