@@ -6,7 +6,11 @@ DOMAIN = "orisec"
 DEFAULT_PORT = 20202
 POLL_INTERVAL = 5
 KEYPAD_POLL_INTERVAL = 2
-UDP_TIMEOUT = 3.0
+# Per attempt. The panel answers in ~0.1-0.3 s, but a reply is lost (not late) when another
+# local client sends at the same moment, so a long wait only delays the retry.
+UDP_TIMEOUT = 1.0
+# Commands are sent once, so their ack gets longer before being reported as missing.
+COMMAND_TIMEOUT = 3.0
 MAX_LOGIN_RETRIES = 3
 SEND_RETRIES = 3
 # Seconds of unanswered polls tolerated (entities keep last state) before going offline.

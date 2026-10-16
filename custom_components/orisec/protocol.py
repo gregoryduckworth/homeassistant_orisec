@@ -12,6 +12,7 @@ from typing import Any
 
 from .const import (
     CMD_CONTROL_OUTPUT,
+    COMMAND_TIMEOUT,
     CMD_ERROR,
     CMD_KEYPAD_CHAR,
     CMD_KEYPRESS,
@@ -438,6 +439,10 @@ class PanelNoResponseError(ConnectionError):
     """The panel never answered a request, even after retries."""
 
 
+class LocalPortInUseError(ConnectionError):
+    """The fixed local UDP port is held by another socket, so the panel can't be reached from it."""
+
+
 class OrisecUDPProtocol(asyncio.DatagramProtocol):
 
     def __init__(self) -> None:
@@ -470,11 +475,19 @@ def local_port_for(host: str, port: int) -> int:
 
 class OrisecConnection:
 
-    def __init__(self, host: str, port: int, timeout: float = UDP_TIMEOUT) -> None:
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        timeout: float = UDP_TIMEOUT,
+        command_timeout: float = COMMAND_TIMEOUT,
+    ) -> None:
         self.host = host
         self.port = port
         self.timeout = timeout
-        # The panel locks onto one client ip:port and refuses others until it times out.
+        self.command_timeout = command_timeout
+        # One source port per panel, kept across reconnects and restarts. The CP20 answers any
+        # endpoint, but older reports had the panel refusing a client whose endpoint changed.
         self.local_port = local_port_for(host, port)
         self._transport: asyncio.DatagramTransport | None = None
         self._protocol: OrisecUDPProtocol | None = None
@@ -483,6 +496,7 @@ class OrisecConnection:
         # Only enforce reply CRCs once the panel has been seen to send valid ones.
         self._crc_trusted = False
         self.stats: dict[str, int] = {
+            "bind_failures": 0,
             "timeouts": 0,
             "retries": 0,
             "refused": 0,
@@ -505,15 +519,14 @@ class OrisecConnection:
         except OSError as err:
             if err.errno != errno.EADDRINUSE:
                 raise
-            _LOGGER.warning(
-                "Local UDP port %d is in use; connecting to %s:%s from a random "
-                "port instead, which the panel may refuse as a new client",
-                self.local_port, self.host, self.port,
-            )
-            self._transport, self._protocol = await loop.create_datagram_endpoint(
-                OrisecUDPProtocol,
-                remote_addr=(self.host, self.port),
-            )
+            # No random-port fallback: the port is only ever held by another client of this
+            # panel on this host, and two clients polling it at once take each other's replies.
+            self.stats["bind_failures"] += 1
+            raise LocalPortInUseError(
+                f"Local UDP port {self.local_port} (used to reach {self.host}:{self.port}) "
+                "is already in use by another socket, e.g. another Home Assistant "
+                "instance or config entry talking to the same panel"
+            ) from err
         _LOGGER.debug(
             "UDP socket %s -> %s:%s",
             self._transport.get_extra_info("sockname"), self.host, self.port,
@@ -549,16 +562,25 @@ class OrisecConnection:
     def connected(self) -> bool:
         return self._transport is not None and not self._transport.is_closing()
 
+    @property
+    def bound_port(self) -> int | None:
+        """The local UDP port the open socket is actually bound to, if any."""
+        if not self.connected:
+            return None
+        return self._transport.get_extra_info("sockname")[1]
+
     async def send_receive(
         self,
         packet: bytearray | bytes,
         settle_time: float = 0.2,
         retries: int = SEND_RETRIES,
         match_commands: bool = True,
+        timeout: float | None = None,
     ) -> list[bytes]:
         async with self._lock:
             return await self._send_receive(
-                packet, settle_time, retries, match_commands
+                packet, settle_time, retries, match_commands,
+                self.timeout if timeout is None else timeout,
             )
 
     async def _send_receive(
@@ -567,6 +589,7 @@ class OrisecConnection:
         settle_time: float,
         retries: int,
         match_commands: bool,
+        timeout: float,
     ) -> list[bytes]:
         if self._transport is None or self._protocol is None:
             raise ConnectionError("Not connected")
@@ -584,15 +607,16 @@ class OrisecConnection:
             self._protocol.error = None
 
             self._transport.sendto(data)
-            replies = await self._collect_replies(expected, settle_time)
+            replies = await self._collect_replies(expected, settle_time, timeout)
             if replies:
                 return replies
 
             if isinstance(self._protocol.error, ConnectionRefusedError):
                 self.stats["refused"] += 1
                 raise PanelRefusedError(
-                    f"Panel at {self.host}:{self.port} refused the connection "
-                    "(nothing listening on that port)"
+                    f"Panel at {self.host}:{self.port} refused the connection from "
+                    f"local port {self.bound_port} (ICMP port unreachable): its network "
+                    "module isn't accepting UDP on that port, e.g. while it restarts"
                 )
 
             if self._protocol.error:
@@ -620,7 +644,7 @@ class OrisecConnection:
         )
 
     async def _collect_replies(
-        self, expected: set[int] | None, settle_time: float
+        self, expected: set[int] | None, settle_time: float, timeout: float
     ) -> list[bytes]:
         """Gather replies to the request just sent, until every block is in or time runs out.
 
@@ -628,7 +652,7 @@ class OrisecConnection:
         """
         assert self._protocol is not None
         loop = asyncio.get_running_loop()
-        deadline = loop.time() + self.timeout
+        deadline = loop.time() + timeout
         replies: list[bytes] = []
         seen: set[int] = set()
         while True:
@@ -702,7 +726,9 @@ class OrisecConnection:
     async def send_keypress(self, key_code: int, area_mask: int) -> ParsedResponse:
         pkt = build_keypress_packet(key_code, area_mask)
         # Commands aren't idempotent: a lost ack must not make us press the key twice.
-        responses = await self.send_receive(pkt, retries=1)
+        responses = await self.send_receive(
+            pkt, retries=1, timeout=self.command_timeout
+        )
         return parse_responses(responses)
 
     async def toggle_output(
@@ -710,7 +736,9 @@ class OrisecConnection:
     ) -> ParsedResponse:
         pkt = build_output_toggle_packet(output_index, current_state)
         # Commands aren't idempotent: a lost ack must not make us press the key twice.
-        responses = await self.send_receive(pkt, retries=1)
+        responses = await self.send_receive(
+            pkt, retries=1, timeout=self.command_timeout
+        )
         return parse_responses(responses)
 
     async def send_data(
@@ -718,11 +746,15 @@ class OrisecConnection:
     ) -> ParsedResponse:
         pkt = load_data_pkt(cmd, start, count, data)
         # Commands aren't idempotent: a lost ack must not make us press the key twice.
-        responses = await self.send_receive(pkt, retries=1)
+        responses = await self.send_receive(
+            pkt, retries=1, timeout=self.command_timeout
+        )
         return parse_responses(responses)
 
     async def send_keypad_char(self, char: str) -> ParsedResponse:
         pkt = build_keypad_char_packet(char)
         # Sent once like other commands; the ack's command ID isn't documented, so take any reply.
-        responses = await self.send_receive(pkt, retries=1, match_commands=False)
+        responses = await self.send_receive(
+            pkt, retries=1, match_commands=False, timeout=self.command_timeout
+        )
         return parse_responses(responses)

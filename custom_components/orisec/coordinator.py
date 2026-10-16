@@ -76,6 +76,7 @@ from .const import (
     ZONE_TYPE_NOT_USED,
 )
 from .protocol import (
+    LocalPortInUseError,
     OrisecConnection,
     PanelNoResponseError,
     PanelRefusedError,
@@ -244,8 +245,9 @@ class OrisecCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.user_area = result.user_area
         self.user_number = result.user_number
         _LOGGER.info(
-            "Login OK: panel=%s max_zones=%d max_areas=%d user_area=0x%X user=%d",
-            self.panel_type, self.max_zones, self.max_areas,
+            "Login OK from local UDP port %s: panel=%s max_zones=%d max_areas=%d "
+            "user_area=0x%X user=%d",
+            self._conn.bound_port, self.panel_type, self.max_zones, self.max_areas,
             self.user_area, self.user_number,
         )
 
@@ -397,12 +399,20 @@ class OrisecCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 return
             except PanelRefusedError as err:
                 self._last_error_refused = True
+                self._last_error = str(err)
                 _LOGGER.warning(
                     "%s; backing off before attempt %d",
                     err, self._reconnect_attempts + 1,
                 )
+            except LocalPortInUseError as err:
+                self._last_error_refused = False
+                self._last_error = str(err)
+                _LOGGER.warning(
+                    "Reconnect attempt %d failed: %s", self._reconnect_attempts, err,
+                )
             except (ConnectionError, OSError, asyncio.TimeoutError, UpdateFailed) as err:
                 self._last_error_refused = False
+                self._last_error = str(err) or type(err).__name__
                 _LOGGER.debug("Reconnect attempt %d failed: %s", self._reconnect_attempts, err)
 
     def _start_reconnect(self) -> None:
@@ -507,6 +517,12 @@ class OrisecCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 raise
             raise UpdateFailed(f"Communication error: {err}") from err
 
+    def _not_connected_message(self) -> str:
+        msg = f"Not connected to panel at {self._host}:{self._port}"
+        if self._last_error:
+            msg += f" (last error: {self._last_error})"
+        return msg
+
     def _poll_succeeded(self) -> None:
         self._last_poll_ok = time.monotonic()
         self._consecutive_failures = 0
@@ -515,7 +531,11 @@ class OrisecCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     def connection_stats(self) -> dict[str, Any]:
         """Counters for diagnosing an unreliable link (kept to rarely-changing values)."""
         return {
+            # Should equal the expected port whenever connected; None while disconnected.
+            "local_port": self._conn.bound_port,
+            "expected_local_port": self._conn.local_port,
             **self._conn.stats,
+            "reconnect_attempts": self._reconnect_attempts,
             "connection_drops": self._connection_drops,
             "consecutive_failures": self._consecutive_failures,
             "last_error": self._last_error,
@@ -580,8 +600,9 @@ class OrisecCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._event_log = self._event_log[-20:]
 
     async def async_send_keypress(self, key_code: int, area_mask: int) -> None:
-        if not self._conn.connected:
-            raise ConnectionError("Not connected to panel")
+        # Not just the socket: an open socket without a logged-in session must not send keys.
+        if not self.connected:
+            raise ConnectionError(self._not_connected_message())
         try:
             await self._conn.send_keypress(key_code, area_mask)
         except PanelNoResponseError as err:
@@ -605,8 +626,8 @@ class OrisecCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         await self.async_send_keypress(KEY_DISARM, area_mask)
 
     async def async_toggle_output(self, output_index: int) -> None:
-        if not self._conn.connected:
-            raise ConnectionError("Not connected to panel")
+        if not self.connected:
+            raise ConnectionError(self._not_connected_message())
         current = 0
         if output_index < len(self.rem_output_state):
             current = self.rem_output_state[output_index]
@@ -742,8 +763,8 @@ class OrisecCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 _LOGGER.debug("Error notifying LCD subscriber", exc_info=True)
 
     async def async_send_keypad_char(self, char: str) -> None:
-        if not self._conn.connected:
-            raise ConnectionError("Not connected to panel")
+        if not self.connected:
+            raise ConnectionError(self._not_connected_message())
         if len(char) != 1 or char not in self._VALID_KEYPAD_CHARS:
             raise ValueError(f"Invalid keypad character: {char!r}")
         await self._conn.send_keypad_char(char)

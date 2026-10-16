@@ -296,7 +296,7 @@ python3 -m pytest tests/test_protocol_unit.py -v
 python3 -m tests.test_live_readonly --host 192.168.1.100 --password YOUR_PIN -v
 ```
 
-This performs comprehensive read-only queries and does **not** arm, disarm, or modify any panel state.
+This performs comprehensive read-only queries and does **not** arm, disarm, or modify any panel state. Running it while Home Assistant (or the app in local mode) is polling the panel works, but both sides will see occasional timeouts while it runs.
 
 ## How It Works
 
@@ -309,17 +309,28 @@ The integration communicates with the panel using its native binary UDP protocol
 
 All communication is local UDP. See [docs/PROTOCOL.md](docs/PROTOCOL.md) for full protocol details.
 
+### Sharing the panel with the ControlPlus2 app
+
+The panel accepts requests from any number of local clients, but it sends each reply to whichever client sent it something most recently. If the ControlPlus2 app in **local** mode (or a second Home Assistant) sends a request while the panel is still answering Home Assistant's (a window of roughly 0.1 s), Home Assistant's reply goes to the app and Home Assistant's request is lost; the same happens the other way round. Login is also shared: the panel holds one logged-in session, used by every client. The app's **cloud** mode goes through Orisec's relay and doesn't compete on the local network.
+
+The integration copes with this. Each attempt waits at most 1 second for a reply (the panel normally answers within 0.3 s), lost polls are retried, and up to 30 seconds of failed polls are ridden out on the last known state. Arm, disarm and output commands are sent only once and wait up to 3 seconds for an acknowledgement; if a busy app takes that acknowledgement, Home Assistant reports that the command may not have been applied, rather than pressing the key again.
+
+Home Assistant always connects from the same local UDP port (21000–21999, derived from the panel's address), across reconnects and restarts. If that port is taken, which only happens when another client of the same panel runs on the same host, the integration reports the conflict and retries; it doesn't move to another port.
+
+The **Panel Info** sensor shows `local_port` (the port in use; empty while disconnected), `expected_local_port`, `bind_failures` and `reconnect_attempts`. `timeouts` and `stale_replies_dropped` that keep rising on an otherwise healthy network mean another local client is polling the panel.
+
 ## Troubleshooting
 
 | Problem | Solution |
 |---------|----------|
 | "Cannot connect" at startup | Integration retries automatically. Check panel IP is reachable (`ping`) and port 20202 is not firewalled. Only the very first setup needs the panel; after that HA starts from the cached configuration. |
 | "Invalid password" | Use the same PIN as your ControlPlus2 mobile app. |
-| Entities show unavailable | The panel hasn't answered for 30 seconds, or rejected the session (e.g. it rebooted). The integration auto-reconnects in the background with backoff. |
-| Connection seems flaky | Check the attributes on the **Panel Info** sensor: rising `timeouts`/`retries` point to packet loss on the network, `stale_replies_dropped` to slow replies, `corrupt_replies_dropped` to damaged packets, and `refused` to another client (e.g. the app in local mode) holding the panel's single session. Enable debug logging for `custom_components.orisec` for detail. |
+| Entities show unavailable | The panel hasn't answered for 30 seconds, or rejected the session (e.g. it rebooted). The integration auto-reconnects in the background with backoff. If it only happens while the ControlPlus2 app is open in local mode, switch the app to cloud mode or close it when you're not using it. |
+| Connection seems flaky | Check the attributes on the **Panel Info** sensor: rising `timeouts`/`retries` point to packet loss on the network, `stale_replies_dropped` to slow replies, `corrupt_replies_dropped` to damaged packets, `refused` to the panel's network module not listening (e.g. while it restarts), and `bind_failures` to another program holding HA's local UDP port. Timeouts and stale replies that rise only while the ControlPlus2 app is open in local mode come from the app competing for the panel's replies (see [Sharing the panel with the ControlPlus2 app](#sharing-the-panel-with-the-controlplus2-app)). `reconnect_attempts` counts the attempts in the current outage. Enable debug logging for `custom_components.orisec` for detail. |
 | "The alarm panel did not acknowledge the command" | The command was sent once but no reply came back, so it may or may not have been applied. Check the alarm state before trying again. |
 | New zones/outputs not appearing | Entities are built from the cached configuration at startup. The cache refreshes once the panel connects; reload the integration to pick up added zones or outputs. |
-| "Refused the connection (nothing listening on that port)" | The panel's IP module only talks to one client at a time and is still holding an old session. The integration always connects from the same local UDP port (21000–21999, derived from the panel address) to avoid this; if it persists, wait for the session to expire or restart the IP module by unplugging its network cable for 30 seconds. |
+| "Refused the connection from local port …" / "The panel refused the connection" | The panel's network module answered "port unreachable" and is refusing every client, not just Home Assistant. What triggers it isn't known. It can clear by itself within a few minutes, but has also lasted over half an hour; Home Assistant can't clear it. Restart the IP module by unplugging its network cable for 30 seconds, then reload the integration to reconnect straight away instead of waiting for its back-off. |
+| "Local UDP port … is already in use" | Another socket on the HA host holds the port this integration uses for the panel, usually a second Home Assistant (e.g. a test instance with host networking) or a duplicate entry for the same panel. Stop the other one; the integration retries and connects once the port is free. |
 | Zones missing | Only zones with a name and type ≠ "Not Used" create entities. |
 | Part Set buttons missing | Your panel may not have part-arm modes configured. Check `part_arm_mask` attribute on the alarm entity. |
 | Arm command ignored | Your user PIN may not have access to that area. Check `user_area` in panel diagnostics. |

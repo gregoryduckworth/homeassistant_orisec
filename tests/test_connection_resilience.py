@@ -34,6 +34,14 @@ class _FakeConfigEntry:
     pass
 
 
+class _FakeConfigFlow:
+    def __init_subclass__(cls, domain=None, **kwargs):
+        super().__init_subclass__(**kwargs)
+
+    def async_show_form(self, **kwargs):
+        return {"type": "form", **kwargs}
+
+
 class _FakeDataUpdateCoordinator:
     def __class_getitem__(cls, item):
         return cls
@@ -81,7 +89,7 @@ class _FakeStore:
 
 
 _ha_ce.ConfigEntry = _FakeConfigEntry
-_ha_ce.ConfigFlow = type("ConfigFlow", (), {"domain": ""})
+_ha_ce.ConfigFlow = _FakeConfigFlow
 _ha_ce.ConfigFlowResult = type("ConfigFlowResult", (), {})
 _ha_core.HomeAssistant = type("HomeAssistant", (), {})
 _ha_core.callback = lambda f: f
@@ -126,12 +134,14 @@ for mod_name, mod in [
     sys.modules[mod_name] = mod
 
 from custom_components.orisec.protocol import (
+    LocalPortInUseError,
     OrisecConnection,
     OrisecUDPProtocol,
     PanelNoResponseError,
     PanelRefusedError,
     ParsedResponse,
 )
+from custom_components.orisec.config_flow import OrisecConfigFlow
 from custom_components.orisec.coordinator import OrisecCoordinator
 from custom_components.orisec.const import SEND_RETRIES
 
@@ -745,23 +755,101 @@ class TestFixedLocalPort(unittest.TestCase):
 
         run_async(_test())
 
-    def test_falls_back_to_random_port_when_in_use(self):
+    def test_port_conflict_is_reported_instead_of_using_a_random_port(self):
         async def _test():
             holder = OrisecConnection("127.0.0.1", 44444)
             await holder.connect()
             other = OrisecConnection("127.0.0.1", 44444)
             try:
-                with self.assertLogs("custom_components.orisec.protocol", "WARNING"):
+                with self.assertRaises(LocalPortInUseError) as ctx:
                     await other.connect()
-                self.assertTrue(other.connected)
-                self.assertNotEqual(
-                    other._transport.get_extra_info("sockname")[1], holder.local_port
-                )
+                self.assertIn(str(holder.local_port), str(ctx.exception))
+                self.assertFalse(other.connected)
+                self.assertIsNone(other.bound_port)
+                self.assertEqual(other.stats["bind_failures"], 1)
             finally:
                 await other.disconnect()
                 await holder.disconnect()
 
         run_async(_test())
+
+    def test_reconnect_waits_for_the_fixed_port_to_free_up(self):
+        async def _test():
+            loop = asyncio.get_running_loop()
+            panel_transport, panel = await loop.create_datagram_endpoint(
+                _FakePanel, local_addr=("127.0.0.1", 0)
+            )
+            port = panel_transport.get_extra_info("sockname")[1]
+            hass = MagicMock()
+            coord = OrisecCoordinator(hass, "127.0.0.1", port, "1234")
+            coord._conn.timeout = 0.05
+            coord._metadata_fresh = True
+            holder = OrisecConnection("127.0.0.1", port)
+            await holder.connect()
+
+            sleeps = 0
+
+            async def fake_sleep(delay):
+                nonlocal sleeps
+                sleeps += 1
+                if sleeps == 2:  # the other socket goes away before the second attempt
+                    await holder.disconnect()
+
+            try:
+                with patch("custom_components.orisec.coordinator.asyncio.sleep", fake_sleep):
+                    with self.assertLogs("custom_components.orisec.coordinator", "WARNING") as logs:
+                        await coord._reconnect()
+
+                self.assertTrue(coord.connected)
+                self.assertIn(str(coord._conn.local_port), "\n".join(logs.output))
+                self.assertEqual(panel.client_ports, {coord._conn.local_port})
+                stats = coord.connection_stats
+                self.assertEqual(stats["bind_failures"], 1)
+                self.assertEqual(stats["local_port"], coord._conn.local_port)
+                self.assertEqual(stats["reconnect_attempts"], 0)
+            finally:
+                await holder.disconnect()
+                await coord.async_shutdown()
+                panel_transport.close()
+
+        run_async(_test())
+
+    def test_stats_show_no_local_port_while_disconnected(self):
+        coord = OrisecCoordinator(MagicMock(), "127.0.0.1", 44444, "1234")
+        coord._reconnect_attempts = 4
+
+        stats = coord.connection_stats
+        self.assertIsNone(stats["local_port"])
+        self.assertEqual(stats["expected_local_port"], coord._conn.local_port)
+        self.assertEqual(stats["reconnect_attempts"], 4)
+
+
+class TestConfigFlowErrors(unittest.TestCase):
+
+    def _submit(self, error: Exception) -> dict:
+        async def _test():
+            flow = OrisecConfigFlow()
+            with patch(
+                "custom_components.orisec.config_flow.OrisecConnection.connect",
+                AsyncMock(side_effect=error),
+            ):
+                return await flow.async_step_user(
+                    {"host": "127.0.0.1", "port": 20202, "password": "1234"}
+                )
+
+        return run_async(_test())
+
+    def test_port_conflict_has_its_own_error(self):
+        result = self._submit(LocalPortInUseError("port 21000 in use"))
+        self.assertEqual(result["errors"], {"base": "port_in_use"})
+
+    def test_refusal_has_its_own_error(self):
+        result = self._submit(PanelRefusedError("refused"))
+        self.assertEqual(result["errors"], {"base": "panel_refused"})
+
+    def test_other_failures_are_cannot_connect(self):
+        result = self._submit(PanelNoResponseError("silent"))
+        self.assertEqual(result["errors"], {"base": "cannot_connect"})
 
 
 class TestPollInterval(unittest.TestCase):
@@ -1058,7 +1146,7 @@ class TestMetadataCache(unittest.TestCase):
 
 
 def _bare_connection(timeout: float = 1.0) -> tuple[OrisecConnection, OrisecUDPProtocol]:
-    conn = OrisecConnection("127.0.0.1", 44444, timeout=timeout)
+    conn = OrisecConnection("127.0.0.1", 44444, timeout=timeout, command_timeout=timeout)
     proto = OrisecUDPProtocol()
     conn._protocol = proto
     conn._transport = MagicMock()
@@ -1177,6 +1265,34 @@ class TestCommandsSentOnce(unittest.TestCase):
 
         run_async(_test())
 
+    def test_commands_wait_longer_for_their_ack_than_reads_wait_per_attempt(self):
+        async def _test():
+            from custom_components.orisec.const import CMD_KEYPRESS, QUERY_SYS_OUTPUT_STATE
+            from custom_components.orisec.protocol import load_udl_pkt
+
+            conn, proto = _bare_connection(timeout=0.05)
+            conn.command_timeout = 1.0
+            loop = asyncio.get_running_loop()
+
+            def answer_slowly(cmd):
+                return lambda data: loop.call_later(
+                    0.2, proto.datagram_received, _reply((cmd, b"")), None
+                )
+
+            conn._transport.sendto = MagicMock(side_effect=answer_slowly(CMD_KEYPRESS))
+            await conn.send_keypress(0, 0x01)
+            self.assertEqual(conn._transport.sendto.call_count, 1)
+
+            conn._transport.sendto = MagicMock(
+                side_effect=answer_slowly(QUERY_SYS_OUTPUT_STATE)
+            )
+            with self.assertRaises(PanelNoResponseError):
+                await conn.send_receive(
+                    load_udl_pkt(QUERY_SYS_OUTPUT_STATE, 1, 65), retries=1
+                )
+
+        run_async(_test())
+
     def test_keypad_char_accepts_any_well_formed_ack(self):
         async def _test():
             conn, proto = _bare_connection()
@@ -1186,6 +1302,28 @@ class TestCommandsSentOnce(unittest.TestCase):
 
             await conn.send_keypad_char("1")
             self.assertEqual(conn._transport.sendto.call_count, 1)
+
+        run_async(_test())
+
+    def test_commands_are_not_sent_without_a_logged_in_session(self):
+        async def _test():
+            # Socket open, but the session was lost and the reconnect hasn't logged in yet.
+            coord = _connected_coordinator()
+            coord._stage = 0
+            coord._last_error = "refused"
+            coord._conn.send_keypress = AsyncMock()
+            coord._conn.toggle_output = AsyncMock()
+            coord._conn.send_keypad_char = AsyncMock()
+
+            with self.assertRaisesRegex(ConnectionError, "refused"):
+                await coord.async_disarm(0x01)
+            with self.assertRaises(ConnectionError):
+                await coord.async_toggle_output(0)
+            with self.assertRaises(ConnectionError):
+                await coord.async_send_keypad_char("1")
+            coord._conn.send_keypress.assert_not_called()
+            coord._conn.toggle_output.assert_not_called()
+            coord._conn.send_keypad_char.assert_not_called()
 
         run_async(_test())
 
